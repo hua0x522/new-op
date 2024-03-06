@@ -2,6 +2,7 @@
 #include "convolution_forward_implicit_gemm_cuda.h"
 #include "../utils/memory.cuh"
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>
 
 // Pack two half values.
 static inline __device__ __host__ unsigned
@@ -442,57 +443,11 @@ __global__ void __launch_bounds__(64) conv_forward_cuda_setting2_mode0_f16f16f32
   }
 }
 
-// conv_forward_cuda_m128n64k32_m64n32k32_m16n16k16_f16f16f32
-__global__ void __launch_bounds__(128) conv_forward_cuda_setting3_mode0_f16f16f32(int M, int K_original, int N, int kernel_volume, half *__restrict__ A, half *__restrict__ B, int *__restrict__ out_in_map, half *__restrict__ C)
-{
-  int K_implicit = K_original * kernel_volume;
-  float C_warp[64];
-  __shared__ half A_shared[5120];
-  __shared__ half B_shared[2304];
-  half A_shared_warp[32];
-  half B_shared_warp[16];
-  for (int i0_0_3_init = 0; i0_0_3_init < 4; ++i0_0_3_init)
-  {
-    for (int i1_0_4_init = 0; i1_0_4_init < 2; ++i1_0_4_init)
-    {
-      for (int i = 0; i < 8; ++i)
-      {
-        C_warp[((i0_0_3_init * 16) + (i1_0_4_init * 8)) + i] = 0.0;
-      };
-    }
-  }
-
-  // hoisting shared pointer offsets
-  int j_factors1 = N / 16 / 4;
-  int *out_in_map_ptr = out_in_map + (blockIdx.x / j_factors1 * 128 + threadIdx.y * 8 + threadIdx.x / 4) * kernel_volume + ((threadIdx.y * 256) % 32) / K_original + ((threadIdx.x * 8) % 32) / K_original;
-  half *A_ptr = A + ((threadIdx.y * 256 % 32) % K_original) + ((threadIdx.x * 8 % 32) % K_original);
-  half *B_ptr = B + (blockIdx.x % j_factors1) * 64 + threadIdx.y * 256 / 64 * N + threadIdx.x * 8 / 64 * N + (threadIdx.x * 8) % 64;
-  int reorder_loc_offset = blockIdx.x / j_factors1 * 8 * 16 + (threadIdx.y % 2) * 4 * 16 + (threadIdx.x / 4);
-  half *C_ptr = C
-                //+ blockIdx.x / j_factors1 * 8 * N / 16 * 256
-                //+ (threadIdx.y % 2) * 4 * N / 16 * 256
-                + (blockIdx.x % j_factors1) * 64 + threadIdx.y / 2 * 32 + (threadIdx.x % 4) * 2;
-  //+ (threadIdx.x / 4) * N;
-
-  // Shang: kernel offset for loading B
-  int B_kernel_offset = threadIdx.y * 256 / 64 + threadIdx.x * 8 / 64;
-
-  for (int i2_0_0 = 0; i2_0_0 < K_implicit / 32; ++i2_0_0)
-
-  {
-
-    int *out_in_map_ptr_local = out_in_map_ptr + i2_0_0 * 32 / K_original;
+__device__ void load_shm_A(half* A_shared, half* A_ptr, int* out_in_map_ptr, int K_original, int kernel_volume, int i2_0_0) {
     half *A_ptr_local = A_ptr + (i2_0_0 * 32 % K_original);
-    half *B_ptr_local = B_ptr + i2_0_0 * 32 * N;
-
-    __syncthreads();
+    int *out_in_map_ptr_local = out_in_map_ptr + i2_0_0 * 32 / K_original;
     for (int ax0_ax1_fused_0 = 0; ax0_ax1_fused_0 < 4; ++ax0_ax1_fused_0)
     {
-
-      // related to input
-      // Haotian: NOTE: what if j_factors[0] != 1?
-      // original:
-      // int input_idx = out_in_map[(((((((int)blockIdx.x) * 3456) + (ax0_ax1_fused_0 * 864)) + (((int)threadIdx.y) * 216)) + ((((int)threadIdx.x) >> 2) * 27)) + (i2_0_0 >> 1))];
       int input_idx = out_in_map_ptr_local[ax0_ax1_fused_0 * 32 * kernel_volume + (ax0_ax1_fused_0 * 1024 % 32) / K_original];
 
       if (input_idx != -1)
@@ -507,6 +462,10 @@ __global__ void __launch_bounds__(128) conv_forward_cuda_setting3_mode0_f16f16f3
         *(uint4 *)(A_shared + ((((ax0_ax1_fused_0 * 1280) + (((int)threadIdx.y) * 320)) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8))) = make_uint4(__pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)), __pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)), __pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)), __pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)));
       }
     }
+}
+
+__device__ void load_shm_B(half* B_shared, half* B_ptr, int B_kernel_offset, int K_original, int N, int i2_0_0) {
+    half *B_ptr_local = B_ptr + i2_0_0 * 32 * N;
     for (int ax0_ax1_fused_0_1 = 0; ax0_ax1_fused_0_1 < 2; ++ax0_ax1_fused_0_1)
     {
       // Shang: skip loading B
@@ -516,8 +475,9 @@ __global__ void __launch_bounds__(128) conv_forward_cuda_setting3_mode0_f16f16f3
           // *(uint4*)(B + ((((i2_0_0 * 2048) + (ax0_ax1_fused_0_1 * 1024)) + (((int)threadIdx.y) * 256)) + (((int)threadIdx.x) * 8)));
           *(uint4 *)(B_ptr_local + ax0_ax1_fused_0_1 * 1024 * N / 64);
     }
-    __syncthreads();
+}
 
+__device__ void pipe_calc(half* A_shared, half* B_shared, half* A_shared_warp, half* B_shared_warp, float* C_warp) {
     for (int i2_0_1 = 0; i2_0_1 < 2; ++i2_0_1)
     {
       for (int ax0_0 = 0; ax0_0 < 4; ++ax0_0)
@@ -614,6 +574,49 @@ __global__ void __launch_bounds__(128) conv_forward_cuda_setting3_mode0_f16f16f3
           }
         }
     }
+}
+
+// conv_forward_cuda_m128n64k32_m64n32k32_m16n16k16_f16f16f32
+__global__ void __launch_bounds__(128) conv_forward_cuda_setting3_mode0_f16f16f32(int M, int K_original, int N, int kernel_volume, half *__restrict__ A, half *__restrict__ B, int *__restrict__ out_in_map, half *__restrict__ C)
+{
+  int K_implicit = K_original * kernel_volume;
+  float C_warp[64];
+  __shared__ half A_shared[5120];
+  __shared__ half B_shared[2304];
+  half A_shared_warp[32];
+  half B_shared_warp[16];
+  for (int i0_0_3_init = 0; i0_0_3_init < 4; ++i0_0_3_init)
+  {
+    for (int i1_0_4_init = 0; i1_0_4_init < 2; ++i1_0_4_init)
+    {
+      for (int i = 0; i < 8; ++i)
+      {
+        C_warp[((i0_0_3_init * 16) + (i1_0_4_init * 8)) + i] = 0.0;
+      };
+    }
+  }
+
+  // hoisting shared pointer offsets
+  int j_factors1 = N / 16 / 4;
+  int *out_in_map_ptr = out_in_map + (blockIdx.x / j_factors1 * 128 + threadIdx.y * 8 + threadIdx.x / 4) * kernel_volume + ((threadIdx.y * 256) % 32) / K_original + ((threadIdx.x * 8) % 32) / K_original;
+  half *A_ptr = A + ((threadIdx.y * 256 % 32) % K_original) + ((threadIdx.x * 8 % 32) % K_original);
+  half *B_ptr = B + (blockIdx.x % j_factors1) * 64 + threadIdx.y * 256 / 64 * N + threadIdx.x * 8 / 64 * N + (threadIdx.x * 8) % 64;
+  int reorder_loc_offset = blockIdx.x / j_factors1 * 8 * 16 + (threadIdx.y % 2) * 4 * 16 + (threadIdx.x / 4);
+  half *C_ptr = C
+                //+ blockIdx.x / j_factors1 * 8 * N / 16 * 256
+                //+ (threadIdx.y % 2) * 4 * N / 16 * 256
+                + (blockIdx.x % j_factors1) * 64 + threadIdx.y / 2 * 32 + (threadIdx.x % 4) * 2;
+  //+ (threadIdx.x / 4) * N;
+
+  // Shang: kernel offset for loading B
+  int B_kernel_offset = threadIdx.y * 256 / 64 + threadIdx.x * 8 / 64;
+
+  for (int i2_0_0 = 0; i2_0_0 < K_implicit / 32; ++i2_0_0)
+  {
+    load_shm_A(A_shared, A_ptr, out_in_map_ptr, K_original, kernel_volume, i2_0_0);
+    load_shm_B(B_shared, B_ptr, B_kernel_offset, K_original, N, i2_0_0);
+    __syncthreads();
+    pipe_calc(A_shared, B_shared, A_shared_warp, B_shared_warp, C_warp);
   }
   for (int ax0_0_1 = 0; ax0_0_1 < 4; ++ax0_0_1)
   {
