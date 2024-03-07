@@ -452,15 +452,20 @@ __device__ void load_shm_A(half* A_shared, half* A_ptr, int* out_in_map_ptr, int
 
       if (input_idx != -1)
       {
-        *(uint4 *)(A_shared + ((((ax0_ax1_fused_0 * 1280) + (((int)threadIdx.y) * 320)) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8))) =
-            // original
-            //  *(uint4*)(A + (((input_idx * 64) + ((i2_0_0 & 1) * 32)) + ((((int)threadIdx.x) & 3) * 8)));
-            *(uint4 *)(A_ptr_local + input_idx * K_original + ((ax0_ax1_fused_0 * 1024 % 32) % K_original));
+        __pipeline_memcpy_async(
+          (uint4 *)(A_shared + ((((ax0_ax1_fused_0 * 1280) + (((int)threadIdx.y) * 320)) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8))),
+          (uint4 *)(A_ptr_local + input_idx * K_original + ((ax0_ax1_fused_0 * 1024 % 32) % K_original)),
+          16);
       }
       else
       {
-        *(uint4 *)(A_shared + ((((ax0_ax1_fused_0 * 1280) + (((int)threadIdx.y) * 320)) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8))) = make_uint4(__pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)), __pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)), __pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)), __pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)));
+        // *(uint4 *)(A_shared + ((((ax0_ax1_fused_0 * 1280) + (((int)threadIdx.y) * 320)) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8))) = make_uint4(0, 0, 0, 0);
+        __pipeline_memcpy_async(
+          (uint4 *)(A_shared + ((((ax0_ax1_fused_0 * 1280) + (((int)threadIdx.y) * 320)) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8))),
+          (uint4 *)(A_ptr_local),
+          16, 16);
       }
+      __syncthreads();
     }
 }
 
@@ -470,14 +475,26 @@ __device__ void load_shm_B(half* B_shared, half* B_ptr, int B_kernel_offset, int
     {
       // Shang: skip loading B
       int B_kernel_offset_local = (B_kernel_offset + i2_0_0 * 32 + ax0_ax1_fused_0_1 * 1024 / 64) / K_original;
-      *(uint4 *)(B_shared + ((((ax0_ax1_fused_0_1 * 1152) + (((int)threadIdx.y) * 288)) + ((((int)threadIdx.x) >> 3) * 72)) + ((((int)threadIdx.x) & 7) * 8))) =
-          // original:
-          // *(uint4*)(B + ((((i2_0_0 * 2048) + (ax0_ax1_fused_0_1 * 1024)) + (((int)threadIdx.y) * 256)) + (((int)threadIdx.x) * 8)));
-          *(uint4 *)(B_ptr_local + ax0_ax1_fused_0_1 * 1024 * N / 64);
+      __pipeline_memcpy_async(
+        (uint4 *)(B_shared + ((((ax0_ax1_fused_0_1 * 1152) + (((int)threadIdx.y) * 288)) + ((((int)threadIdx.x) >> 3) * 72)) + ((((int)threadIdx.x) & 7) * 8))),
+        (uint4 *)(B_ptr_local + ax0_ax1_fused_0_1 * 1024 * N / 64),
+        16);
     }
 }
 
-__device__ void pipe_calc(half* A_shared, half* B_shared, half* A_shared_warp, half* B_shared_warp, float* C_warp) {
+__device__ void pipe_load(half* A_shared, half* A_ptr, int* out_in_map_ptr, int K_original, int kernel_volume,
+                          half* B_shared, half* B_ptr, int B_kernel_offset, int N, int i2_0_0) {
+    A_shared += (i2_0_0 % 2) * 5120;
+    B_shared += (i2_0_0 % 2) * 2304;
+    
+    load_shm_A(A_shared, A_ptr, out_in_map_ptr, K_original, kernel_volume, i2_0_0);
+    load_shm_B(B_shared, B_ptr, B_kernel_offset, K_original, N, i2_0_0);
+}
+
+__device__ void pipe_calc(half* A_shared, half* B_shared, half* A_shared_warp, half* B_shared_warp, float* C_warp, int i2_0_0) {
+    A_shared += (i2_0_0 % 2) * 5120;
+    B_shared += (i2_0_0 % 2) * 2304;
+
     for (int i2_0_1 = 0; i2_0_1 < 2; ++i2_0_1)
     {
       for (int ax0_0 = 0; ax0_0 < 4; ++ax0_0)
@@ -581,8 +598,8 @@ __global__ void __launch_bounds__(128) conv_forward_cuda_setting3_mode0_f16f16f3
 {
   int K_implicit = K_original * kernel_volume;
   float C_warp[64];
-  __shared__ half A_shared[5120];
-  __shared__ half B_shared[2304];
+  __shared__ half A_shared[2 * 5120];
+  __shared__ half B_shared[2 * 2304];
   half A_shared_warp[32];
   half B_shared_warp[16];
   for (int i0_0_3_init = 0; i0_0_3_init < 4; ++i0_0_3_init)
@@ -611,13 +628,20 @@ __global__ void __launch_bounds__(128) conv_forward_cuda_setting3_mode0_f16f16f3
   // Shang: kernel offset for loading B
   int B_kernel_offset = threadIdx.y * 256 / 64 + threadIdx.x * 8 / 64;
 
-  for (int i2_0_0 = 0; i2_0_0 < K_implicit / 32; ++i2_0_0)
+  pipe_load(A_shared, A_ptr, out_in_map_ptr, K_original, kernel_volume, B_shared, B_ptr, B_kernel_offset, N, 0);
+  __pipeline_commit();
+
+  for (int i2_0_0 = 1; i2_0_0 < K_implicit / 32; ++i2_0_0)
   {
-    load_shm_A(A_shared, A_ptr, out_in_map_ptr, K_original, kernel_volume, i2_0_0);
-    load_shm_B(B_shared, B_ptr, B_kernel_offset, K_original, N, i2_0_0);
-    __syncthreads();
-    pipe_calc(A_shared, B_shared, A_shared_warp, B_shared_warp, C_warp);
+    pipe_load(A_shared, A_ptr, out_in_map_ptr, K_original, kernel_volume, B_shared, B_ptr, B_kernel_offset, N, i2_0_0);
+    __pipeline_commit();
+    __pipeline_wait_prior(1);
+    pipe_calc(A_shared, B_shared, A_shared_warp, B_shared_warp, C_warp, i2_0_0 - 1);
   }
+
+  __pipeline_wait_prior(0);
+  pipe_calc(A_shared, B_shared, A_shared_warp, B_shared_warp, C_warp, K_implicit / 32 - 1);
+
   for (int ax0_0_1 = 0; ax0_0_1 < 4; ++ax0_0_1)
   {
 
