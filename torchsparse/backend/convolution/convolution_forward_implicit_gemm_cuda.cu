@@ -615,7 +615,7 @@ __global__ void __launch_bounds__(128) conv_forward_cuda_setting3_mode0_f16f16f3
 
   // hoisting shared pointer offsets
   int j_factors1 = N / 16 / 4;
-  int *out_in_map_ptr = out_in_map + (blockIdx.x / j_factors1 * 128 + threadIdx.y * 8 + threadIdx.x / 4) * kernel_volume + ((threadIdx.y * 256) % 32) / K_original + ((threadIdx.x * 8) % 32) / K_original;
+  int *out_in_map_ptr = out_in_map + (blockIdx.x / j_factors1 * 128 + threadIdx.y * 8 + threadIdx.x / 4) * kernel_volume;
   half *A_ptr = A + ((threadIdx.y * 256 % 32) % K_original) + ((threadIdx.x * 8 % 32) % K_original);
   half *B_ptr = B + (blockIdx.x % j_factors1) * 64 + threadIdx.y * 256 / 64 * N + threadIdx.x * 8 / 64 * N + (threadIdx.x * 8) % 64;
   int reorder_loc_offset = blockIdx.x / j_factors1 * 8 * 16 + (threadIdx.y % 2) * 4 * 16 + (threadIdx.x / 4);
