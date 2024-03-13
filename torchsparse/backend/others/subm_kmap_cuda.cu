@@ -16,6 +16,9 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
+#include <ctime>
+#include <sys/time.h>
+
 struct custom_t
 {
   int loc, x, y, z, w;
@@ -106,17 +109,30 @@ __global__ void data_copy(int4* coords, custom_t* loc_coords, int n_points) {
 }
 
 at::Tensor subm_kmap_cuda(at::Tensor _coords, at::Tensor _kernel_sizes) {
+    struct timeval tv;
+    double start, end;
     int n_points = _coords.size(0);
     int4 *coords = (int4*)_coords.data_ptr<int>();
     custom_t* loc_coords;
     custom_t* sorted_coords;
+
+    gettimeofday(&tv, nullptr);
+    start = tv.tv_sec + tv.tv_usec / 1.0e6;
+
     cudaMalloc(&loc_coords, n_points * sizeof(custom_t));
     cudaMalloc(&sorted_coords, n_points * sizeof(custom_t));
     data_copy<<<CDIV(n_points, 256), 256>>>(coords, loc_coords, n_points);
     cudaDeviceSynchronize();
+
+    gettimeofday(&tv, nullptr);
+    end = tv.tv_sec + tv.tv_usec / 1.0e6;
+    printf("time1: %lf\n", end - start);
     
     std::uint8_t *d_temp_storage{};
     std::size_t temp_storage_bytes{};
+
+    gettimeofday(&tv, nullptr);
+    start = tv.tv_sec + tv.tv_usec / 1.0e6;
 
     cub::DeviceRadixSort::SortKeys(d_temp_storage,
                                  temp_storage_bytes,
@@ -136,17 +152,29 @@ at::Tensor subm_kmap_cuda(at::Tensor _coords, at::Tensor _kernel_sizes) {
                                  decomposer_t{});
     cudaDeviceSynchronize();
 
+    gettimeofday(&tv, nullptr);
+    end = tv.tv_sec + tv.tv_usec / 1.0e6;
+    printf("time2: %lf\n", end - start);
+
     auto options = torch::TensorOptions()
                     .dtype(at::ScalarType::Int)
                     .device(_coords.device());
 
     at::Tensor _out_in_map = torch::full({CDIV(n_points, 128) * 128, 27}, -1, options);
     int* out_in_map = _out_in_map.data_ptr<int>();
+
+    gettimeofday(&tv, nullptr);
+    start = tv.tv_sec + tv.tv_usec / 1.0e6;
     
     subm_kmap_kernel<<<CDIV(n_points, 256), 256>>>(
         sorted_coords,
         out_in_map, 
         n_points);
+    cudaDeviceSynchronize();
+
+    gettimeofday(&tv, nullptr);
+    end = tv.tv_sec + tv.tv_usec / 1.0e6;
+    printf("time3: %lf\n", end - start);
 
     return _out_in_map;
 }
