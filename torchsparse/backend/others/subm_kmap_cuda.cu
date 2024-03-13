@@ -2,19 +2,37 @@
 #include "subm_kmap_cuda.h"
 #include <cuda_fp16.h>
 
-#define NDim 4
-#define MAX_KVOL 27
-#define BLOCK_SIZE 256
-#define CHECK_CUDA2(func)                                              \
-    {                                                                  \
-        cudaError_t status = (func);                                   \
-        if (status != cudaSuccess) {                                   \
-            printf("CUDA API failed at line %d with error: %s (%d)\n", \
-                   __LINE__, cudaGetErrorString(status), status);      \
-        }                                                              \
-    }
-    
-#define COORD(X, Y, Z) make_int4(0, X, Y, Z)
+#include <cuda/std/tuple>
+#include <cub/device/device_radix_sort.cuh>
+
+#include <bitset>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <type_traits>
+#include "cub/block/radix_rank_sort_operations.cuh"
+
+#include <thrust/detail/raw_pointer_cast.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+
+struct custom_t
+{
+  int loc, x, y, z, w;
+};
+
+struct decomposer_t
+{
+  __host__ __device__ //
+  ::cuda::std::tuple<int&, int&, int&, int&> operator()(custom_t &key) const
+  {
+    return {key.x, key.y, key.z, key.w};
+  }
+};
+
+#define CDIV(X, Y) (((X) + (Y) - 1) / (Y))  
+#define INT4(X, Y, Z) make_int4(0, X, Y, Z)
+#define COORD(tid) (make_int4(coords[tid].x, coords[tid].y, coords[tid].z, coords[tid].w))
 
 __device__ int4 add(int4 a, int4 b) {
     return make_int4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
@@ -41,64 +59,94 @@ __device__ bool equal(int4 a, int4 b) {
 }
 
 __global__ void subm_kmap_kernel(
-        int4* coords, 
+        custom_t* coords, 
         int* out_in_map, 
         int n_points) {
     int4 offsets[14] = {
-        COORD(0, 0, 0), COORD(0, 0, 1), COORD(0, 1, -1), COORD(0, 1, 0), COORD(0, 1, 1), COORD(1, -1, -1), COORD(1, -1, 0), 
-        COORD(1, -1, 1), COORD(1, 0, -1), COORD(1, 0, 0), COORD(1, 0, 1), COORD(1, 1, -1), COORD(1, 1, 0), COORD(1, 1, 1)
+        INT4(0, 0, 0), INT4(0, 0, 1), INT4(0, 1, -1), INT4(0, 1, 0), INT4(0, 1, 1), INT4(1, -1, -1), INT4(1, -1, 0), 
+        INT4(1, -1, 1), INT4(1, 0, -1), INT4(1, 0, 0), INT4(1, 0, 1), INT4(1, 1, -1), INT4(1, 1, 0), INT4(1, 1, 1)
     };
 
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n_points) {
-        out_in_map[tid * 27 + 27 / 2] = tid;
-        int4 out_coord = coords[tid];
+        int loc = coords[tid].loc;
+        out_in_map[loc * 27 + 27 / 2] = loc;
+        int4 out_coord = COORD(tid);
 
         int l = tid, r = n_points - 1, mid;
         for (int i = 1; i <= 27 / 2; i++) {
             int4 in_coord = add(out_coord, offsets[i]); 
             l = tid;
             r = n_points - 1;
-            if (tid == 242 && i == 9) {
-                printf("%d %d %d\n", in_coord.y, in_coord.z, in_coord.w);
-            }
             while (l < r) {
                 mid = (l + r) >> 1;
-                if (tid == 242 && i == 9) {
-                    printf("%d %d %d %d %d %d\n", l, r, mid, coords[mid].y, coords[mid].z, coords[mid].w);
-                }   
-                if (great_equal(coords[mid], in_coord)) {
+                if (great_equal(COORD(mid), in_coord)) {
                     r = mid;
                 } else {
                     l = mid + 1;
                 }
             }
             r = l;
-            if (equal(coords[r], in_coord)) {
+            if (equal(COORD(r), in_coord)) {
+                int loc_r = coords[r].loc;
                 int idx = (offsets[i].w + 1) * 9 + (offsets[i].z + 1) * 3 + (offsets[i].y + 1);
-                out_in_map[tid * 27 + idx] = r;
-                out_in_map[r * 27 + 26 - idx] = tid;
+                out_in_map[loc * 27 + idx] = loc_r;
+                out_in_map[loc_r * 27 + 26 - idx] = loc;
             } 
         }
+    }
+}
+
+__global__ void data_copy(int4* coords, custom_t* loc_coords, int n_points) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < n_points) {
+        int4 coord = coords[tid];
+        loc_coords[tid] = {tid, coord.x, coord.y, coord.z, coord.w};
     }
 }
 
 at::Tensor subm_kmap_cuda(at::Tensor _coords, at::Tensor _kernel_sizes) {
     int n_points = _coords.size(0);
     int4 *coords = (int4*)_coords.data_ptr<int>();
+    custom_t* loc_coords;
+    custom_t* sorted_coords;
+    cudaMalloc(&loc_coords, n_points * sizeof(custom_t));
+    cudaMalloc(&sorted_coords, n_points * sizeof(custom_t));
+    data_copy<<<CDIV(n_points, 256), 256>>>(coords, loc_coords, n_points);
+    cudaDeviceSynchronize();
+    
+    std::uint8_t *d_temp_storage{};
+    std::size_t temp_storage_bytes{};
+
+    cub::DeviceRadixSort::SortKeys(d_temp_storage,
+                                 temp_storage_bytes,
+                                 loc_coords,
+                                 sorted_coords,
+                                 n_points,
+                                 decomposer_t{});
+    
+    thrust::device_vector<std::uint8_t> temp_storage(temp_storage_bytes);
+    d_temp_storage = thrust::raw_pointer_cast(temp_storage.data());
+
+    cub::DeviceRadixSort::SortKeys(d_temp_storage,
+                                 temp_storage_bytes,
+                                 loc_coords,
+                                 sorted_coords,
+                                 n_points,
+                                 decomposer_t{});
+    cudaDeviceSynchronize();
 
     auto options = torch::TensorOptions()
                     .dtype(at::ScalarType::Int)
                     .device(_coords.device());
 
-    at::Tensor _out_in_map = torch::full({n_points, 27}, -1, options);
+    at::Tensor _out_in_map = torch::full({CDIV(n_points, 128) * 128, 27}, -1, options);
     int* out_in_map = _out_in_map.data_ptr<int>();
     
-    subm_kmap_kernel<<<(n_points + BLOCK_SIZE - 1)/BLOCK_SIZE, BLOCK_SIZE>>>(
-        coords,
+    subm_kmap_kernel<<<CDIV(n_points, 256), 256>>>(
+        sorted_coords,
         out_in_map, 
         n_points);
-    CHECK_CUDA2(cudaGetLastError());
 
     return _out_in_map;
 }
