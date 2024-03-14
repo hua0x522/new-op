@@ -1,6 +1,7 @@
 #include <torch/extension.h>
+#include <vector>
 
-at::Tensor downsample_kmap_cuda(
+std::vector<at::Tensor> downsample_kmap_cuda(
     at::Tensor old_map,
     at::Tensor coords
 );
