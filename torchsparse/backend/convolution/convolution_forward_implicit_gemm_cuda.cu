@@ -443,7 +443,7 @@ __global__ void __launch_bounds__(64) conv_forward_cuda_setting2_mode0_f16f16f32
   }
 }
 
-__device__ void load_shm_A(half* A_shared, half* A_ptr, int* out_in_map_ptr, int K_original, int kernel_volume, int i2_0_0) {
+__device__ void load_shm_A_ts(half* A_shared, half* A_ptr, int* out_in_map_ptr, int K_original, int kernel_volume, int i2_0_0) {
     half *A_ptr_local = A_ptr + (i2_0_0 * 32 % K_original);
     int *out_in_map_ptr_local = out_in_map_ptr + i2_0_0 * 32 / K_original;
     for (int ax0_ax1_fused_0 = 0; ax0_ax1_fused_0 < 4; ++ax0_ax1_fused_0)
@@ -469,7 +469,7 @@ __device__ void load_shm_A(half* A_shared, half* A_ptr, int* out_in_map_ptr, int
     }
 }
 
-__device__ void load_shm_B(half* B_shared, half* B_ptr, int B_kernel_offset, int K_original, int N, int i2_0_0) {
+__device__ void load_shm_B_ts(half* B_shared, half* B_ptr, int B_kernel_offset, int K_original, int N, int i2_0_0) {
     half *B_ptr_local = B_ptr + i2_0_0 * 32 * N;
     for (int ax0_ax1_fused_0_1 = 0; ax0_ax1_fused_0_1 < 2; ++ax0_ax1_fused_0_1)
     {
@@ -482,16 +482,16 @@ __device__ void load_shm_B(half* B_shared, half* B_ptr, int B_kernel_offset, int
     }
 }
 
-__device__ void pipe_load(half* A_shared, half* A_ptr, int* out_in_map_ptr, int K_original, int kernel_volume,
+__device__ void pipe_load_ts(half* A_shared, half* A_ptr, int* out_in_map_ptr, int K_original, int kernel_volume,
                           half* B_shared, half* B_ptr, int B_kernel_offset, int N, int i2_0_0) {
     A_shared += (i2_0_0 % 2) * 5120;
     B_shared += (i2_0_0 % 2) * 2304;
     
-    load_shm_A(A_shared, A_ptr, out_in_map_ptr, K_original, kernel_volume, i2_0_0);
-    load_shm_B(B_shared, B_ptr, B_kernel_offset, K_original, N, i2_0_0);
+    load_shm_A_ts(A_shared, A_ptr, out_in_map_ptr, K_original, kernel_volume, i2_0_0);
+    load_shm_B_ts(B_shared, B_ptr, B_kernel_offset, K_original, N, i2_0_0);
 }
 
-__device__ void pipe_calc(half* A_shared, half* B_shared, half* A_shared_warp, half* B_shared_warp, float* C_warp, int i2_0_0) {
+__device__ void pipe_calc_ts(half* A_shared, half* B_shared, half* A_shared_warp, half* B_shared_warp, float* C_warp, int i2_0_0) {
     A_shared += (i2_0_0 % 2) * 5120;
     B_shared += (i2_0_0 % 2) * 2304;
 
@@ -628,19 +628,19 @@ __global__ void __launch_bounds__(128) conv_forward_cuda_setting3_mode0_f16f16f3
   // Shang: kernel offset for loading B
   int B_kernel_offset = threadIdx.y * 256 / 64 + threadIdx.x * 8 / 64;
 
-  pipe_load(A_shared, A_ptr, out_in_map_ptr, K_original, kernel_volume, B_shared, B_ptr, B_kernel_offset, N, 0);
+  pipe_load_ts(A_shared, A_ptr, out_in_map_ptr, K_original, kernel_volume, B_shared, B_ptr, B_kernel_offset, N, 0);
   __pipeline_commit();
 
   for (int i2_0_0 = 1; i2_0_0 < K_implicit / 32; ++i2_0_0)
   {
-    pipe_load(A_shared, A_ptr, out_in_map_ptr, K_original, kernel_volume, B_shared, B_ptr, B_kernel_offset, N, i2_0_0);
+    pipe_load_ts(A_shared, A_ptr, out_in_map_ptr, K_original, kernel_volume, B_shared, B_ptr, B_kernel_offset, N, i2_0_0);
     __pipeline_commit();
     __pipeline_wait_prior(1);
-    pipe_calc(A_shared, B_shared, A_shared_warp, B_shared_warp, C_warp, i2_0_0 - 1);
+    pipe_calc_ts(A_shared, B_shared, A_shared_warp, B_shared_warp, C_warp, i2_0_0 - 1);
   }
 
   __pipeline_wait_prior(0);
-  pipe_calc(A_shared, B_shared, A_shared_warp, B_shared_warp, C_warp, K_implicit / 32 - 1);
+  pipe_calc_ts(A_shared, B_shared, A_shared_warp, B_shared_warp, C_warp, K_implicit / 32 - 1);
 
   for (int ax0_0_1 = 0; ax0_0_1 < 4; ++ax0_0_1)
   {

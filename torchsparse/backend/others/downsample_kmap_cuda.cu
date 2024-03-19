@@ -82,7 +82,7 @@ std::vector<at::Tensor> downsample_kmap_cuda(at::Tensor _old_map, at::Tensor _co
     cudaMalloc(&cnt, sizeof(int));
     cudaMemset(cnt, 0, sizeof(int));
 
-    downsample_kmap_kernel<<<CDIV(n_points, 256), 256>>>(old_map, coords, out_in_map, new_coords, cnt, n_points);
+    downsample_kmap_kernel<<<CDIV(n_points, 128), 128>>>(old_map, coords, out_in_map, new_coords, cnt, n_points);
     cudaDeviceSynchronize();
     int value;
     cudaMemcpy(&value, cnt, sizeof(int), cudaMemcpyDeviceToHost);
