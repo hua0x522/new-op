@@ -8,199 +8,181 @@
 #include <cuda_pipeline.h>
 #include <cuda_fp16.h>
 #include <cuda.h>
+#include "ptx.h"
 
 #define cdiv(x, y) (((x) + (y) - 1) / (y))
 
 #define BLK_M 128
-#define BLK_N 128
+#define BLK_N 64
 #define BLK_K 32
 #define WARP_M 64
-#define WARP_N 64
+#define WARP_N 32
 #define MMA_M 16
 #define MMA_N 16
 #define MMA_K 16
 #define num_threads (32 * (BLK_M / WARP_M) * (BLK_N / WARP_N))
 #define cdiv(x, y) (((x) + (y) - 1) / (y))
 
-using FragA = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, MMA_M, MMA_N, MMA_K, half, nvcuda::wmma::row_major>;
-using FragB = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, MMA_M, MMA_N, MMA_K, half, nvcuda::wmma::row_major>;
-using Accum = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, MMA_M, MMA_N, MMA_K, float>;
+// __device__ void reorder_map(int* out_in_map, int num_in_channels, int ko) {
+//     __shared__ int shm_map[128];
+//     __shared__ int loc_map[128];
+//     __shared__ int cnt = 0;
+//     int valid_mma = 0;
 
-__device__ void load_shm_A(half *shm_A, half *A, int* out_in_map, int num_in_channels, int kernel_volume, int ko)
+//     int tid = threadIdx.z * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x;
+//     shm_map[tid] = out_in_map[(ko * BLK_K / num_in_channels) * M + (blockIdx.y * BLK_M + tid)];
+//     if (shm_map[tid] != -1) {
+//         int idx = atomic_add(&cnt, 1);
+//         loc_map[idx] = tid;
+//     }
+//     __syncthreads();
+//     valid_mma = cdiv(cnt, 16);
+//     if (tid >= cnt) {
+//         loc_map[tid] = -1;
+//     }
+//     __syncthreads();
+// }
+
+__device__ void load_shm_A(half *shm_A, half *A, int* out_in_map, int M, int num_in_channels, int kernel_volume, int ko)
 {
-    // load BLK_M * BLK_K
-    // layout: [row_out, col_out, row_in, col_in] = [BLK_M / 16, BLK_K / 16, 16, 16]
-    int tid = threadIdx.z * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x;
-    for (int i = 0; i < (BLK_M * BLK_K) / (8 * num_threads); ++i) {
-        int row = i * (8 * num_threads / BLK_K) + tid / (BLK_K / 8);
-        int col = tid % (BLK_K / 8) * 8;
-        void *ptr = (void *)(shm_A + row / 16 * ((BLK_K / 16) * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
-
-        int row_A = out_in_map[(blockIdx.y * BLK_M + row) * kernel_volume + (ko * BLK_K + col) / num_in_channels];
-        int col_A = (ko * BLK_K + col) % num_in_channels;
-
+    // layout: [64, 64]
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    for (int i = 0; i < 8; i++) {
+        int row = i * 8 + tid / 8;
+        int col = tid % 8 * 8;
+        int shm_row = row;
+        int shm_col = col ^ ((shm_row & 3) << 3);
+        int row_A = out_in_map[(blockIdx.x * 64 + row) * kernel_volume + (ko * 64 + col) / num_in_channels];
+        int col_A = (ko * 64 + col) % num_in_channels;
+        void* ptr = &shm_A[shm_row * 64 + shm_col];
         if (row_A == -1) {
             *(float4*)ptr = make_float4(0, 0, 0, 0);
-        } 
-        else {
-            __pipeline_memcpy_async(
-                ptr,
-                &A[row_A * num_in_channels + col_A],
-                16
-            );
+        } else {
+            *(float4*)ptr = *(float4*)&A[row_A * num_in_channels + col_A];
         }
-        __syncthreads();
-    }
-}
-
-__device__ void load_shm_B(half *shm_B, half *B, int N, int K, int ko)
-{
-    // load BLK_K * BLK_N
-    // layout: [row_out, col_out, row_in, col_in] = [BLK_K / 16, BLK_N / 16, 16, 16]
-    int tid = threadIdx.z * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x;
-    for (int i = 0; i < (BLK_K * BLK_N) / (8 * num_threads); ++i) {
-        int row = i * (8 * num_threads / BLK_N) + tid / (BLK_N / 8);
-        int col = tid % (BLK_N / 8) * 8;
-        void *ptr = (void *)(shm_B + row / 16 * ((BLK_N / 16) * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
-
-        __pipeline_memcpy_async(
-            ptr,
-            &B[(ko * BLK_K + row) * N + (blockIdx.x * BLK_N + col)],
-            16
-        );
-        __syncthreads();
-    }
-}
-
-__device__ void store_shm_C(half *C, float *shm_C, int M, int N)
-{
-    // load BLK_M * BLK_N
-    int tid = threadIdx.z * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x;
-    for (int i = 0; i < (BLK_M * BLK_N) / num_threads; i++) {
-        int row = i * num_threads / BLK_N + tid / BLK_N;
-        int col = i * num_threads % BLK_N + tid % BLK_N;
-        C[(blockIdx.y * BLK_M + row) * N + blockIdx.x * BLK_N + col] = 
-            __float2half(shm_C[row / 16 * ((BLK_N / 16) * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16]);
-    }
-}
-
-__device__ void load_frag_A(FragA *frag, half *shm_A, int ki)
-{
-    // load WARP_M * WARP_K
-    for (int i = 0; i < WARP_M / MMA_M; ++i)
-    {
-        int row = threadIdx.z * WARP_M + i * MMA_M;
-        int col = ki * MMA_K;
-        nvcuda::wmma::load_matrix_sync(frag[i], shm_A + row / 16 * ((BLK_K / 16) * 16 * 16) + col / 16 * (16 * 16), 16);
-    }
-}
-
-__device__ void load_frag_B(FragB *frag, half *shm_B, int ki)
-{
-    // load WARP_K * WARP_N
-    for (int i = 0; i < WARP_N / MMA_N; ++i)
-    {
-        int row = ki * MMA_K; 
-        int col = threadIdx.y * WARP_N + i * MMA_N;
-        nvcuda::wmma::load_matrix_sync(frag[i], shm_B + row / 16 * ((BLK_N / 16) * 16 * 16) + col / 16 * (16 * 16), 16);
     }
     __syncthreads();
 }
 
-__device__ void store_Accum(float *ptr, Accum *frag)
+__device__ void load_shm_B(half *shm_B, half *B, int N, int K, int ko)
 {
-    // store 64x64
-    for (int i = 0; i < WARP_M / MMA_M; ++i)
-    {
-        for (int j = 0; j < WARP_N / MMA_N; ++j)
-        {
-            int row = threadIdx.z * WARP_M + i * MMA_M;
-            int col = threadIdx.y * WARP_N + j * MMA_N;
-            // layout: [WARP_M / MMA_M, WARP_N / MMA_N, MMA_M, MMA_N]
-            nvcuda::wmma::store_matrix_sync(ptr + row / 16 * ((BLK_N / 16) * 16 * 16) + col / 16 * (16 * 16), 
-                                            frag[i * (WARP_N / MMA_N) + j], 16, nvcuda::wmma::mem_row_major);
-        }
+    // layout: [64, 64]
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    for (int i = 0; i < 8; i++) {
+        int row = i * 8 + tid / 8;
+        int col = tid % 8 * 8;
+        int shm_row = row;
+        int shm_col = col ^ ((shm_row & 3) << 3);
+        *(float4*)&shm_B[shm_row * 64 + shm_col] = *(float4*)&B[(ko * 64 + row) * N + blockIdx.y * 64 + col];
+    }
+    __syncthreads();
+}
+
+__device__ void store_shm_C(float *shm_C, half *C, int M, int N) 
+{
+    // layout: [64, 64]
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    for (int i = 0; i < 64; i++) {
+        int row = i;
+        int col = tid;
+        int shm_row = row;
+        int shm_col = col ^ ((shm_row & 3) << 3);
+        C[(blockIdx.x * 64 + row) * N + blockIdx.y * 64 + col] = __float2half(shm_C[shm_row * 64 + shm_col]);
+    }
+    __syncthreads();
+}
+
+__device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int mi, int ki)
+{
+    int lane_id = threadIdx.x;
+    int row = mi * 16 + lane_id % 16;
+    int col = ki * 16 + lane_id / 16 * 8;
+    col = col ^ ((row & 3) << 3);
+    uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + row * 64 + col);
+    LDMATRIX_X4(reg_A[0], reg_A[1], reg_A[2], reg_A[3], shm_A_lane_addr);
+    __syncthreads();
+}
+
+__device__ void load_reg_B(uint32_t* reg_B, half* shm_B, int ki)
+{
+    int lane_id = threadIdx.x;
+    for (int ni = 0; ni < 4; ni++) {
+        int row = ki * 16 + lane_id % 16;
+        int col = threadIdx.y * 32 + ni * 8;
+        col = col ^ ((row & 3) << 3);
+        uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + row * 64 + col + ni * 8);
+        LDMATRIX_X2_T(reg_B[ki * 8 + ni * 2], reg_B[ki * 8 + ni * 2 + 1], shm_B_lane_addr);
     }
 }
 
-__device__ void pipe_load(half* shm_A, half* shm_B, half* A, half* B, int* out_in_map, 
-                          int N, int num_in_channels, int kernel_volume, int ko) {
-    shm_A += (ko % 4) * BLK_M * BLK_K;
-    shm_B += (ko % 4) * BLK_N * BLK_K;
-    load_shm_A(shm_A, A, out_in_map, num_in_channels, kernel_volume, ko);
-    load_shm_B(shm_B, B, N, num_in_channels * kernel_volume, ko);
+__device__ void store_reg_C(uint32_t* reg_C, float* shm_C, int mi)
+{
+    int lane_id = threadIdx.x;
+
+    for (int ni = 0; ni < 4; ni++) {
+        int row = mi * 16 + lane_id / 4;
+        int col = threadIdx.y * 32 + ni * 8 + (lane_id % 4) * 2;
+        col = col ^ ((row & 3) << 3);
+        shm_C[row * 64 + col] += *(float*)(&reg_C[ni * 4]);
+        shm_C[row * 64 + col + 1] += *(float*)(&reg_C[ni * 4 + 1]);
+        shm_C[(row + 8) * 64 + col] += *(float*)(&reg_C[ni * 4 + 2]);
+        shm_C[(row + 8) * 64 + col + 1] += *(float*)(&reg_C[ni * 4 + 3]);
+    }
 }
 
-__device__ void pipe_calc(FragA* frag_A, FragB* frag_B, Accum* accum, half* shm_A, half* shm_B, int ko) {
-    shm_A += (ko % 4) * BLK_M * BLK_K;
-    shm_B += (ko % 4) * BLK_N * BLK_K;
-    for (int ki = 0; ki < BLK_K / MMA_K; ki += 1)
-    {
-        // 64x64x16 mma for each warp
-        load_frag_A(frag_A, shm_A, ki);
-        load_frag_B(frag_B, shm_B, ki);
-        for (int mii = 0; mii < WARP_M / MMA_M; mii += 1)
-        {
-            for (int nii = 0; nii < WARP_N / MMA_N; nii += 1)
-            {
-                // 16x16x16 for each wmma
-                nvcuda::wmma::mma_sync(accum[mii * (WARP_N / MMA_N) + nii], frag_A[mii], frag_B[nii], accum[mii * (WARP_N / MMA_N) + nii]);
-            }
-        }
+__device__ void clear_shm_C(float* shm_C) {
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    for (int i = 0; i < 64; i++) {
+        shm_C[i * 64 + tid] = 0;
+    }
+}
+
+__device__ void clear_reg_C(uint32_t* reg_C) {
+    for (int i = 0; i < 16; i++) {
+        reg_C[i] = 0;
     }
 }
 
 __global__ void my_conv_kernel(int M, int num_in_channels, int N, int kernel_volume, half *__restrict__ A, 
                     half *__restrict__ B, int *__restrict__ out_in_map, half *__restrict__ C) {
-    extern __shared__ uint8_t shared_storage[];
-    half *shm_A = reinterpret_cast<half *>(shared_storage);
-    half* shm_B = shm_A + 4 * BLK_M * BLK_K;
-    float *shm_C = reinterpret_cast<float *>(shared_storage);
+    __shared__ half shm_A[64 * 64];
+    __shared__ half shm_B[64 * 64];
+    __shared__ float shm_C[64 * 64];
 
-    FragA frag_A[WARP_M / MMA_M];
-    FragB frag_B[WARP_N / MMA_N];
-    Accum accum[WARP_M / MMA_M * WARP_N / MMA_N];
-
-    for (int mii = 0; mii < WARP_M / MMA_M; mii += 1)
-    {
-        for (int nii = 0; nii < WARP_N / MMA_N; nii += 1)
-        {
-            nvcuda::wmma::fill_fragment(accum[mii * (WARP_N / MMA_N) + nii], 0.0);
-        }
-    }
+    uint32_t reg_A[4];
+    uint32_t reg_B[4 * 4 * 2];
+    uint32_t reg_C[4 * 4];
+    clear_shm_C(shm_C);
     
     int K = num_in_channels * kernel_volume;
 
-    pipe_load(shm_A, shm_B, A, B, out_in_map, N, num_in_channels, kernel_volume, 0);
-    __pipeline_commit();
-
-    pipe_load(shm_A, shm_B, A, B, out_in_map, N, num_in_channels, kernel_volume, 1);
-    __pipeline_commit();
-
-    pipe_load(shm_A, shm_B, A, B, out_in_map, N, num_in_channels, kernel_volume, 2);
-    __pipeline_commit();
-
-    for (int ko = 3; ko < K / BLK_K; ko++) {
-        pipe_load(shm_A, shm_B, A, B, out_in_map, N, num_in_channels, kernel_volume, ko);
-        __pipeline_commit();
-        __pipeline_wait_prior(3);
-        pipe_calc(frag_A, frag_B, accum, shm_A, shm_B, ko - 3);
+    for (int k = 0; k < K / 64; k++) {
+        load_shm_A(shm_A, A, out_in_map, M, num_in_channels, kernel_volume, k);
+        load_shm_B(shm_B, B, N, K, k);
         __syncthreads();
+
+        for (int ki = 0; ki < 4; ki++) {
+            load_reg_B(reg_B, shm_B, ki);
+        }
+
+        for (int m = 0; m < 4; m++) {
+            clear_reg_C(reg_C);
+            for (int ki = 0; ki < 4; ki++) {
+                load_reg_A(reg_A, shm_A, m, ki);
+                __syncthreads();
+
+                for (int n = 0; n < 4; n++) {
+                    HMMA16816(reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3],
+                              reg_A[0], reg_A[1], reg_A[2], reg_A[3],
+                              reg_B[ki * 8 + n * 2], reg_B[ki * 8 + n * 2 + 1],
+                              reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3]);
+                }
+            }
+            __syncthreads();
+            store_reg_C(reg_C, shm_C, m);
+        }
     }
-
-    __pipeline_wait_prior(2);
-    pipe_calc(frag_A, frag_B, accum, shm_A, shm_B, K / BLK_K - 3);
-    __syncthreads();
-    __pipeline_wait_prior(1);
-    pipe_calc(frag_A, frag_B, accum, shm_A, shm_B, K / BLK_K - 2);
-    __syncthreads();
-    __pipeline_wait_prior(0);
-    pipe_calc(frag_A, frag_B, accum, shm_A, shm_B, K / BLK_K - 1);
-    __syncthreads();
-
-    store_Accum(shm_C, accum);
-    __syncthreads();
-    store_shm_C(C, shm_C, M, N);
+    store_shm_C(shm_C, C, M, N);
 }
 
 at::Tensor my_conv_cuda(torch::Tensor _in_feats, torch::Tensor _kernel, torch::Tensor _out_in_map, 
@@ -227,12 +209,12 @@ at::Tensor my_conv_cuda(torch::Tensor _in_feats, torch::Tensor _kernel, torch::T
     int M = _out_feats.size(0);
     int N = num_out_channels;
 
-    int smem_size = max(4 * (BLK_M + BLK_N) * BLK_K * 2, BLK_M * BLK_N * 4);
-    if (smem_size >= (48 << 10)) {
-        cudaFuncSetAttribute(my_conv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    }
+    // int smem_size = max(2 * (BLK_M + BLK_N) * BLK_K * 2, BLK_M * BLK_N * 4);
+    // if (smem_size >= (48 << 10)) {
+    //     cudaFuncSetAttribute(my_conv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    // }
 
-    my_conv_kernel<<<dim3(cdiv(N, BLK_N), cdiv(M, BLK_M)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M), smem_size, nullptr>>>
+    my_conv_kernel<<<dim3(cdiv(M, 64), cdiv(N, 64)), dim3(32, 2)>>>
                     (M, num_in_channels, num_out_channels, kernel_volume, in_feats, kernel, out_in_map, out_feats);
     
     return _out_feats;
