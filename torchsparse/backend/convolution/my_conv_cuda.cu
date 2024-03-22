@@ -12,38 +12,7 @@
 
 #define cdiv(x, y) (((x) + (y) - 1) / (y))
 
-#define BLK_M 128
-#define BLK_N 64
-#define BLK_K 32
-#define WARP_M 64
-#define WARP_N 32
-#define MMA_M 16
-#define MMA_N 16
-#define MMA_K 16
-#define num_threads (32 * (BLK_M / WARP_M) * (BLK_N / WARP_N))
-#define cdiv(x, y) (((x) + (y) - 1) / (y))
-
-// __device__ void reorder_map(int* out_in_map, int num_in_channels, int ko) {
-//     __shared__ int shm_map[128];
-//     __shared__ int loc_map[128];
-//     __shared__ int cnt = 0;
-//     int valid_mma = 0;
-
-//     int tid = threadIdx.z * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x;
-//     shm_map[tid] = out_in_map[(ko * BLK_K / num_in_channels) * M + (blockIdx.y * BLK_M + tid)];
-//     if (shm_map[tid] != -1) {
-//         int idx = atomic_add(&cnt, 1);
-//         loc_map[idx] = tid;
-//     }
-//     __syncthreads();
-//     valid_mma = cdiv(cnt, 16);
-//     if (tid >= cnt) {
-//         loc_map[tid] = -1;
-//     }
-//     __syncthreads();
-// }
-
-__device__ void load_shm_A(half *shm_A, half *A, int* out_in_map, int M, int num_in_channels, int kernel_volume, int ko)
+__device__ void load_shm_A(half *shm_A, half *A, int* out_in_map, int num_in_channels, int kernel_volume, int ko)
 {
     // layout: [64, 64]
     int tid = threadIdx.y * 32 + threadIdx.x;
@@ -157,7 +126,7 @@ __global__ void my_conv_kernel(int M, int num_in_channels, int N, int kernel_vol
     int K = num_in_channels * kernel_volume;
 
     for (int k = 0; k < K / 64; k++) {
-        load_shm_A(shm_A, A, out_in_map, M, num_in_channels, kernel_volume, k);
+        load_shm_A(shm_A, A, out_in_map, num_in_channels, kernel_volume, k);
         load_shm_B(shm_B, B, N, K, k);
         __syncthreads();
 
