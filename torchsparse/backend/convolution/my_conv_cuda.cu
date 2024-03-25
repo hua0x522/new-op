@@ -16,8 +16,8 @@ __device__ void load_shm_A(half *shm_A, half *A, int* reorder_map, int valid, in
 {
     // layout: [64, 64]
     int tid = threadIdx.y * 32 + threadIdx.x;
-    for (int i = 0; i < valid * 2; i++) {
-        int row = i * 8 + tid / 8;
+    for (int i = 0; i < valid; i++) {
+        int row = i * 16 + tid / 8;
         int col = tid % 8 * 8;
         int shm_row = row;
         int shm_col = col ^ ((shm_row & 3) << 3);
@@ -37,8 +37,8 @@ __device__ void load_shm_B(half *shm_B, half *B, int N, int K, int ko)
 {
     // layout: [64, 64]
     int tid = threadIdx.y * 32 + threadIdx.x;
-    for (int i = 0; i < 8; i++) {
-        int row = i * 8 + tid / 8;
+    for (int i = 0; i < 4; i++) {
+        int row = i * 16 + tid / 8;
         int col = tid % 8 * 8;
         int shm_row = row;
         int shm_col = col ^ ((shm_row & 3) << 3);
@@ -51,9 +51,9 @@ __device__ void store_shm_C(float *shm_C, half *C, int M, int N)
 {
     // layout: [64, 64]
     int tid = threadIdx.y * 32 + threadIdx.x;
-    for (int i = 0; i < 64; i++) {
-        int row = i;
-        int col = tid;
+    for (int i = 0; i < 32; i++) {
+        int row = i * 2 + tid / 64;
+        int col = tid % 64;
         int shm_row = row;
         int shm_col = col ^ ((shm_row & 3) << 3);
         C[(blockIdx.x * 64 + row) * N + blockIdx.y * 64 + col] = __float2half(shm_C[shm_row * 64 + shm_col]);
@@ -61,26 +61,28 @@ __device__ void store_shm_C(float *shm_C, half *C, int M, int N)
     __syncthreads();
 }
 
-__device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int mi, int ki)
+__device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int mi)
 {
-    int lane_id = threadIdx.x;
-    int row = mi * 16 + lane_id % 16;
-    int col = ki * 16 + lane_id / 16 * 8;
-    col = col ^ ((row & 3) << 3);
-    uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + row * 64 + col);
-    LDMATRIX_X4(reg_A[0], reg_A[1], reg_A[2], reg_A[3], shm_A_lane_addr);
+    for (int ki = 0; ki < 4; ki++) {
+        int lane_id = threadIdx.x;
+        int row = mi * 16 + lane_id % 16;
+        int col = ki * 16 + lane_id / 16 * 8;
+        col = col ^ ((row & 3) << 3);
+        uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + row * 64 + col);
+        LDMATRIX_X4(reg_A[ki * 4], reg_A[ki * 4 + 1], reg_A[ki * 4 + 2], reg_A[ki * 4 + 3], shm_A_lane_addr);
+    }
     __syncthreads();
 }
 
 __device__ void load_reg_B(uint32_t* reg_B, half* shm_B, int ki)
 {
     int lane_id = threadIdx.x;
-    for (int ni = 0; ni < 4; ni++) {
+    for (int ni = 0; ni < 2; ni++) {
         int row = ki * 16 + lane_id % 16;
-        int col = threadIdx.y * 32 + ni * 8;
+        int col = threadIdx.y * 16 + ni * 8;
         col = col ^ ((row & 3) << 3);
         uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + row * 64 + col + ni * 8);
-        LDMATRIX_X2_T(reg_B[ki * 8 + ni * 2], reg_B[ki * 8 + ni * 2 + 1], shm_B_lane_addr);
+        LDMATRIX_X2_T(reg_B[ki * 4 + ni * 2], reg_B[ki * 4 + ni * 2 + 1], shm_B_lane_addr);
     }
 }
 
@@ -88,9 +90,9 @@ __device__ void store_reg_C(uint32_t* reg_C, float* shm_C, int* loc_map, int mi)
 {
     int lane_id = threadIdx.x;
 
-    for (int ni = 0; ni < 4; ni++) {
+    for (int ni = 0; ni < 2; ni++) {
         int row = mi * 16 + lane_id / 4;
-        int col = threadIdx.y * 32 + ni * 8 + (lane_id % 4) * 2;
+        int col = threadIdx.y * 16 + ni * 8 + (lane_id % 4) * 2;
         col = col ^ ((row & 3) << 3);
         if (loc_map[row] != -1) {
             shm_C[loc_map[row] * 64 + col] += *(float*)(&reg_C[ni * 4]);
@@ -103,13 +105,13 @@ __device__ void store_reg_C(uint32_t* reg_C, float* shm_C, int* loc_map, int mi)
 
 __device__ void clear_shm_C(float* shm_C) {
     int tid = threadIdx.y * 32 + threadIdx.x;
-    for (int i = 0; i < 64; i++) {
-        shm_C[i * 64 + tid] = 0;
+    for (int i = 0; i < 32; i++) {
+        shm_C[i * 128 + tid] = 0;
     }
 }
 
 __device__ void clear_reg_C(uint32_t* reg_C) {
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 8; i++) {
         reg_C[i] = 0;
     }
 }
@@ -121,8 +123,8 @@ __global__ void my_conv_kernel(int M, int c_in, int N, int kernel_volume,
     __shared__ half shm_B[64 * 64];
     __shared__ float shm_C[64 * 64];
 
-    uint32_t reg_A[4];
-    uint32_t reg_B[4 * 4 * 2];
+    uint32_t reg_A[4 * 4];
+    uint32_t reg_B[4 * 2 * 2];
     uint32_t reg_C[4 * 4];
     clear_shm_C(shm_C);
     
@@ -131,29 +133,28 @@ __global__ void my_conv_kernel(int M, int c_in, int N, int kernel_volume,
     for (int k = 0; k < K / 64; k++) {
         int offset = k * 64 / c_in * M + blockIdx.x * 64;
         int valid = valid_map[k * 64 / c_in * M / 64 + blockIdx.x];
-        load_shm_A(shm_A, A, reorder_map + offset, valid, M, c_in, k);
-        load_shm_B(shm_B, B, N, K, k);
-        __syncthreads();
-
-        for (int ki = 0; ki < 4; ki++) {
-            load_reg_B(reg_B, shm_B, ki);
-        }
-
-        for (int m = 0; m < valid; m++) {
-            clear_reg_C(reg_C);
-            for (int ki = 0; ki < 4; ki++) {
-                load_reg_A(reg_A, shm_A, m, ki);
-                __syncthreads();
-
-                for (int n = 0; n < 4; n++) {
-                    HMMA16816(reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3],
-                              reg_A[0], reg_A[1], reg_A[2], reg_A[3],
-                              reg_B[ki * 8 + n * 2], reg_B[ki * 8 + n * 2 + 1],
-                              reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3]);
-                }
-            }
+        if (valid > 0) {
+            load_shm_A(shm_A, A, reorder_map + offset, valid, M, c_in, k);
+            load_shm_B(shm_B, B, N, K, k);
             __syncthreads();
-            store_reg_C(reg_C, shm_C, loc_map + offset, m);
+    
+            for (int ki = 0; ki < 4; ki++) {
+                load_reg_B(reg_B, shm_B, ki);
+            }
+    
+            for (int m = 0; m < valid; m++) {
+                clear_reg_C(reg_C);
+                load_reg_A(reg_A, shm_A, m);
+                for (int ki = 0; ki < 4; ki++) {
+                    for (int n = 0; n < 2; n++) {
+                        HMMA16816(reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3],
+                                  reg_A[ki * 4], reg_A[ki * 4 + 1], reg_A[ki * 4 + 2], reg_A[ki * 4 + 3],
+                                  reg_B[ki * 4 + n * 2], reg_B[ki * 4 + n * 2 + 1],
+                                  reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3]);
+                    }
+                }
+                store_reg_C(reg_C, shm_C, loc_map + offset, m);
+            }
         }
     }
     store_shm_C(shm_C, C, M, N);

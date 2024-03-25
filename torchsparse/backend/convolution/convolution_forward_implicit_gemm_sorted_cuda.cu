@@ -3,6 +3,7 @@
 #include "../utils/memory.cuh"
 #include <cuda_fp16.h>
 #include <stdexcept>
+#include <cuda_pipeline.h>
 
 // Pack two half values.
 static inline __device__ __host__ unsigned
@@ -490,14 +491,152 @@ __global__ void __launch_bounds__(64) conv_forward_cuda_setting2_mode1_f16f16f32
   }
 }
 
+__device__ void load_shm_A_s3m1(half* A_shared, half* A_ptr, int* out_in_map_ptr, int kernel_volume, int K_original, int i2_0_0) {
+  int* out_in_map_ptr_local = out_in_map_ptr + i2_0_0 * 32 / K_original;
+  half* A_ptr_local = A_ptr + (i2_0_0 * 32 % K_original);
+  
+  for(int ax0_ax1_fused_0 = 0; ax0_ax1_fused_0 < 4; ++ax0_ax1_fused_0) {
+    int input_idx = out_in_map_ptr_local[
+          (ax0_ax1_fused_0 * 32) * kernel_volume
+          + (ax0_ax1_fused_0 * 1024 % 32) / K_original
+        ];
+
+    if(input_idx != -1) {
+      __pipeline_memcpy_async(
+        A_shared + ((((ax0_ax1_fused_0 * 1280) + (((int)threadIdx.y) * 320)) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8)),
+        A_ptr_local + input_idx * K_original + ((ax0_ax1_fused_0 * 1024 % 32) % K_original),
+        16
+      );
+    }
+    else {
+      *(uint4 *)(A_shared + ((((ax0_ax1_fused_0 * 1280) + (((int)threadIdx.y) * 320)) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8))) = make_uint4(0, 0, 0, 0);
+    }
+  }
+}
+
+__device__ void load_shm_B_s3m1(half* B_shared, half* B_ptr, int N, int i2_0_0) {
+  half* B_ptr_local = B_ptr + i2_0_0 * 32 * N;
+
+  for (int ax0_ax1_fused_0_1 = 0; ax0_ax1_fused_0_1 < 2; ++ax0_ax1_fused_0_1) {
+    __pipeline_memcpy_async(
+      B_shared + ((((ax0_ax1_fused_0_1 * 1152) + (((int)threadIdx.y) * 288)) + ((((int)threadIdx.x) >> 3) * 72)) + ((((int)threadIdx.x) & 7) * 8)),
+      B_ptr_local + ax0_ax1_fused_0_1 * 1024 * N / 64,
+      16
+    );
+  }
+}
+
+__device__ void pipe_load_s3m1(half* A_shared, half* B_shared, half* A_ptr, half* B_ptr, int* out_in_map_ptr, 
+                               int kernel_volume, int K_original, int N, int i2_0_0) {
+  A_shared = A_shared + (i2_0_0 & 1) * 5120;
+  B_shared = B_shared + (i2_0_0 & 1) * 2304;
+  load_shm_A_s3m1(A_shared, A_ptr, out_in_map_ptr, kernel_volume, K_original, i2_0_0);
+  load_shm_B_s3m1(B_shared, B_ptr, N, i2_0_0);
+  __syncthreads();
+}
+
+__device__ void pipe_calc_s3m1(half* A_shared, half* B_shared, half* A_shared_warp, half* B_shared_warp, float* C_warp, int i2_0_0) {
+  A_shared = A_shared + (i2_0_0 & 1) * 5120;
+  B_shared = B_shared + (i2_0_0 & 1) * 2304;
+  for (int i2_0_1 = 0; i2_0_1 < 2; ++i2_0_1) {
+    for (int ax0_0 = 0; ax0_0 < 4; ++ax0_0) {
+          {
+            unsigned int addr;
+            __asm__ __volatile__(
+                "{ .reg .u64 addr; cvta.to.shared.u64 addr, %1; cvt.u32.u64 %0, addr; }"
+                : "=r"(addr)
+                : "l"((void *)((&(A_shared[((((((int)threadIdx.y) & 1) * 2560) + (ax0_0 * 640)) + (i2_0_1 * 16))])) + (((((int)threadIdx.x) & 15) * 40) + ((((int)threadIdx.x) >> 4) * 8)))));
+#if __CUDA_ARCH__ >= 750
+            __asm__ __volatile__(
+                "ldmatrix.sync.aligned.m8n8.x4.shared.b16"
+                "{%0, %1, %2, %3}, [%4];"
+                : "=r"(((unsigned *)(A_shared_warp + (ax0_0 * 8)))[0]), "=r"(((unsigned *)(A_shared_warp + (ax0_0 * 8)))[1]), "=r"(((unsigned *)(A_shared_warp + (ax0_0 * 8)))[2]), "=r"(((unsigned *)(A_shared_warp + (ax0_0 * 8)))[3])
+                : "r"(addr));
+#else
+  #pragma message("FP16 kernels will not be compiled for SM75-.")
+#endif
+          }
+    }
+    for (int ax1_0 = 0; ax1_0 < 2; ++ax1_0) {
+          {
+            unsigned int addr;
+            __asm__ __volatile__(
+                "{ .reg .u64 addr; cvta.to.shared.u64 addr, %1; cvt.u32.u64 %0, addr; }"
+                : "=r"(addr)
+                : "l"((void *)((&(B_shared[(((i2_0_1 * 1152) + ((((int)threadIdx.y) >> 1) * 32)) + (ax1_0 * 16))])) + (((((int)threadIdx.x) & 15) * 72) + ((((int)threadIdx.x) >> 4) * 8)))));
+#if __CUDA_ARCH__ >= 750
+            __asm__ __volatile__(
+                "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16"
+                "{%0, %1, %2, %3}, [%4];"
+                : "=r"(((unsigned *)(B_shared_warp + (ax1_0 * 8)))[0]), "=r"(((unsigned *)(B_shared_warp + (ax1_0 * 8)))[1]), "=r"(((unsigned *)(B_shared_warp + (ax1_0 * 8)))[2]), "=r"(((unsigned *)(B_shared_warp + (ax1_0 * 8)))[3])
+                : "r"(addr));
+#else
+  #pragma message("FP16 kernels will not be compiled for SM75-.")
+#endif
+          }
+    }
+    for (int i0_0_3 = 0; i0_0_3 < 4; ++i0_0_3) {
+      for (int i1_0_4 = 0; i1_0_4 < 2; ++i1_0_4) {
+#if __CUDA_ARCH__ >= 800
+            {
+              __asm__ __volatile__(
+                  "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+                  : "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3])
+                  : "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[0]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[1]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[2]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[3]), "r"(((unsigned *)(B_shared_warp + (i1_0_4 * 8)))[0]), "r"(((unsigned *)(B_shared_warp + (i1_0_4 * 8)))[1]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3]));
+            }
+
+            {
+              __asm__ __volatile__(
+                  "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+                  : "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3])
+                  : "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[0]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[1]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[2]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[3]), "r"(((unsigned *)(B_shared_warp + ((i1_0_4 * 8) + 4)))[0]), "r"(((unsigned *)(B_shared_warp + ((i1_0_4 * 8) + 4)))[1]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3]));
+            }
+#elif __CUDA_ARCH__ >= 750
+            {
+              __asm__ __volatile__(
+                  "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32"
+                  "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
+                  : "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3])
+                  : "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[0]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[1]), "r"(((unsigned *)(B_shared_warp + (i1_0_4 * 8)))[0]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3]));
+            }
+            {
+              __asm__ __volatile__(
+                  "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32"
+                  "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
+                  : "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3])
+                  : "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[0]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[1]), "r"(((unsigned *)(B_shared_warp + ((i1_0_4 * 8) + 4)))[0]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3]));
+            }
+            {
+              __asm__ __volatile__(
+                  "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32"
+                  "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
+                  : "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3])
+                  : "r"(((unsigned *)(A_shared_warp + ((i0_0_3 * 8) + 4)))[0]), "r"(((unsigned *)(A_shared_warp + ((i0_0_3 * 8) + 4)))[1]), "r"(((unsigned *)(B_shared_warp + ((i1_0_4 * 8) + 2)))[0]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3]));
+            }
+            {
+              __asm__ __volatile__(
+                  "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32"
+                  "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
+                  : "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3])
+                  : "r"(((unsigned *)(A_shared_warp + ((i0_0_3 * 8) + 4)))[0]), "r"(((unsigned *)(A_shared_warp + ((i0_0_3 * 8) + 4)))[1]), "r"(((unsigned *)(B_shared_warp + ((i1_0_4 * 8) + 6)))[0]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3]));
+            }
+#else
+  #pragma message("FP16 kernels will not be compiled for SM75-.")
+#endif
+      }
+    }
+  }
+}
 
 // conv_forward_cuda_m128n64k32_m64n32k32_m16n16k16_f16f16f32_sort
 __global__ void __launch_bounds__(128) conv_forward_cuda_setting3_mode1_f16f16f32(int M, int K_original, int N, int kernel_volume, int split_mask_len, int reduced_mask_len, int reorder_loc_len, half *__restrict__ A, half *__restrict__ B, int *__restrict__ reduced_mask, int *__restrict__ out_in_map, int *__restrict__ reorder_loc, half *__restrict__ C)
 {
   int K_implicit = K_original * kernel_volume;
   float C_warp[64];
-  __shared__ half A_shared[5120];
-  __shared__ half B_shared[2304];
+  __shared__ half A_shared[2 * 5120];
+  __shared__ half B_shared[2 * 2304];
   half A_shared_warp[32];
   half B_shared_warp[16];
   for (int i0_0_3_init = 0; i0_0_3_init < 4; ++i0_0_3_init)
@@ -553,160 +692,27 @@ __global__ void __launch_bounds__(128) conv_forward_cuda_setting3_mode1_f16f16f3
   int K_st = blockIdx_z * split_mask_len;
   int K_ed = min(kernel_volume, (blockIdx_z + 1) * split_mask_len);
 
-  for (int i2_0_0 = K_st * K_original / 32; i2_0_0 < K_ed * K_original / 32; ++i2_0_0)
-
+  pipe_load_s3m1(A_shared, B_shared, A_ptr, B_ptr, out_in_map_ptr, kernel_volume, K_original, N, K_st * K_original / 32);
+  __pipeline_commit();
+  int pre_load = K_st * K_original / 32;
+  __syncthreads();
+  for (int i2_0_0 = K_st * K_original / 32 + 1; i2_0_0 < K_ed * K_original / 32; ++i2_0_0)
   {
-
     int kernel_offset = i2_0_0 / (K_original / 32) - K_st;
-
     bool bit_flag = (bool)(reduced_mask_ptr[blockIdx_y / j_factors1] & (1 << kernel_offset));
     if (bit_flag)
     {
-
-      int* out_in_map_ptr_local = out_in_map_ptr + i2_0_0 * 32 / K_original;
-      half* A_ptr_local = A_ptr + (i2_0_0 * 32 % K_original);
-      half* B_ptr_local = B_ptr + i2_0_0 * 32 * N;
-
+      pipe_load_s3m1(A_shared, B_shared, A_ptr, B_ptr, out_in_map_ptr, kernel_volume, K_original, N, i2_0_0);
+      __pipeline_commit();
+      __pipeline_wait_prior(1);
+      pipe_calc_s3m1(A_shared, B_shared, A_shared_warp, B_shared_warp, C_warp, pre_load);
+      pre_load = i2_0_0;
       __syncthreads();
-      for (int ax0_ax1_fused_0 = 0; ax0_ax1_fused_0 < 4; ++ax0_ax1_fused_0)
-      {
-
-        // related to input
-        // Haotian: NOTE: what if j_factors[0] != 1?
-        // original:
-        // int input_idx = out_in_map[(((((((int)blockIdx_y) * 3456) + (ax0_ax1_fused_0 * 864)) + (((int)threadIdx.y) * 216)) + ((((int)threadIdx.x) >> 2) * 27)) + (i2_0_0 >> 1))];
-        int input_idx = out_in_map_ptr_local[
-          (ax0_ax1_fused_0 * 32) * kernel_volume
-          + (ax0_ax1_fused_0 * 1024 % 32) / K_original
-        ];
-
-        if (input_idx != -1)
-        {
-          *(uint4 *)(A_shared + ((((ax0_ax1_fused_0 * 1280) + (((int)threadIdx.y) * 320)) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8))) =
-              // original
-              //  *(uint4*)(A + (((input_idx * 64) + ((i2_0_0 & 1) * 32)) + ((((int)threadIdx.x) & 3) * 8)));
-              *(uint4*)(
-                A_ptr_local
-                + input_idx * K_original 
-                + ((ax0_ax1_fused_0 * 1024 % 32) % K_original)
-              );
-        }
-        else
-        {
-          *(uint4 *)(A_shared + ((((ax0_ax1_fused_0 * 1280) + (((int)threadIdx.y) * 320)) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8))) = make_uint4(__pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)), __pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)), __pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)), __pack_half2(__float2half_rn(0.000000e+00f), __float2half_rn(0.000000e+00f)));
-        }
-      }
-      for (int ax0_ax1_fused_0_1 = 0; ax0_ax1_fused_0_1 < 2; ++ax0_ax1_fused_0_1)
-      {
-        *(uint4 *)(B_shared + ((((ax0_ax1_fused_0_1 * 1152) + (((int)threadIdx.y) * 288)) + ((((int)threadIdx.x) >> 3) * 72)) + ((((int)threadIdx.x) & 7) * 8))) =
-          // original:
-          // *(uint4*)(B + ((((i2_0_0 * 2048) + (ax0_ax1_fused_0_1 * 1024)) + (((int)threadIdx.y) * 256)) + (((int)threadIdx.x) * 8)));
-          *(uint4*)(
-            B_ptr_local
-            + ax0_ax1_fused_0_1 * 1024 * N / 64
-          );
-        
-      }
-      __syncthreads();
-
-      for (int i2_0_1 = 0; i2_0_1 < 2; ++i2_0_1)
-      {
-        for (int ax0_0 = 0; ax0_0 < 4; ++ax0_0)
-        {
-
-          {
-            unsigned int addr;
-            __asm__ __volatile__(
-                "{ .reg .u64 addr; cvta.to.shared.u64 addr, %1; cvt.u32.u64 %0, addr; }"
-                : "=r"(addr)
-                : "l"((void *)((&(A_shared[((((((int)threadIdx.y) & 1) * 2560) + (ax0_0 * 640)) + (i2_0_1 * 16))])) + (((((int)threadIdx.x) & 15) * 40) + ((((int)threadIdx.x) >> 4) * 8)))));
-#if __CUDA_ARCH__ >= 750
-            __asm__ __volatile__(
-                "ldmatrix.sync.aligned.m8n8.x4.shared.b16"
-                "{%0, %1, %2, %3}, [%4];"
-                : "=r"(((unsigned *)(A_shared_warp + (ax0_0 * 8)))[0]), "=r"(((unsigned *)(A_shared_warp + (ax0_0 * 8)))[1]), "=r"(((unsigned *)(A_shared_warp + (ax0_0 * 8)))[2]), "=r"(((unsigned *)(A_shared_warp + (ax0_0 * 8)))[3])
-                : "r"(addr));
-#else
-  #pragma message("FP16 kernels will not be compiled for SM75-.")
-#endif
-          }
-        }
-        for (int ax1_0 = 0; ax1_0 < 2; ++ax1_0)
-        {
-          {
-            unsigned int addr;
-            __asm__ __volatile__(
-                "{ .reg .u64 addr; cvta.to.shared.u64 addr, %1; cvt.u32.u64 %0, addr; }"
-                : "=r"(addr)
-                : "l"((void *)((&(B_shared[(((i2_0_1 * 1152) + ((((int)threadIdx.y) >> 1) * 32)) + (ax1_0 * 16))])) + (((((int)threadIdx.x) & 15) * 72) + ((((int)threadIdx.x) >> 4) * 8)))));
-#if __CUDA_ARCH__ >= 750
-            __asm__ __volatile__(
-                "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16"
-                "{%0, %1, %2, %3}, [%4];"
-                : "=r"(((unsigned *)(B_shared_warp + (ax1_0 * 8)))[0]), "=r"(((unsigned *)(B_shared_warp + (ax1_0 * 8)))[1]), "=r"(((unsigned *)(B_shared_warp + (ax1_0 * 8)))[2]), "=r"(((unsigned *)(B_shared_warp + (ax1_0 * 8)))[3])
-                : "r"(addr));
-#else
-  #pragma message("FP16 kernels will not be compiled for SM75-.")
-#endif
-          }
-        }
-        for (int i0_0_3 = 0; i0_0_3 < 4; ++i0_0_3)
-        {
-          for (int i1_0_4 = 0; i1_0_4 < 2; ++i1_0_4)
-          {
-#if __CUDA_ARCH__ >= 800
-            {
-              __asm__ __volatile__(
-                  "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
-                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
-                  : "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3])
-                  : "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[0]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[1]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[2]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[3]), "r"(((unsigned *)(B_shared_warp + (i1_0_4 * 8)))[0]), "r"(((unsigned *)(B_shared_warp + (i1_0_4 * 8)))[1]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3]));
-            }
-
-            {
-              __asm__ __volatile__(
-                  "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
-                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
-                  : "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3])
-                  : "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[0]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[1]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[2]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[3]), "r"(((unsigned *)(B_shared_warp + ((i1_0_4 * 8) + 4)))[0]), "r"(((unsigned *)(B_shared_warp + ((i1_0_4 * 8) + 4)))[1]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3]));
-            }
-#elif __CUDA_ARCH__ >= 750
-            {
-              __asm__ __volatile__(
-                  "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32"
-                  "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
-                  : "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3])
-                  : "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[0]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[1]), "r"(((unsigned *)(B_shared_warp + (i1_0_4 * 8)))[0]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3]));
-            }
-            {
-              __asm__ __volatile__(
-                  "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32"
-                  "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
-                  : "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3])
-                  : "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[0]), "r"(((unsigned *)(A_shared_warp + (i0_0_3 * 8)))[1]), "r"(((unsigned *)(B_shared_warp + ((i1_0_4 * 8) + 4)))[0]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3]));
-            }
-            {
-              __asm__ __volatile__(
-                  "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32"
-                  "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
-                  : "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "=f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3])
-                  : "r"(((unsigned *)(A_shared_warp + ((i0_0_3 * 8) + 4)))[0]), "r"(((unsigned *)(A_shared_warp + ((i0_0_3 * 8) + 4)))[1]), "r"(((unsigned *)(B_shared_warp + ((i1_0_4 * 8) + 2)))[0]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[0]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[1]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[2]), "f"(((float *)(C_warp + ((i0_0_3 * 16) + (i1_0_4 * 8))))[3]));
-            }
-            {
-              __asm__ __volatile__(
-                  "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32"
-                  "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
-                  : "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "=f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3])
-                  : "r"(((unsigned *)(A_shared_warp + ((i0_0_3 * 8) + 4)))[0]), "r"(((unsigned *)(A_shared_warp + ((i0_0_3 * 8) + 4)))[1]), "r"(((unsigned *)(B_shared_warp + ((i1_0_4 * 8) + 6)))[0]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[0]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[1]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[2]), "f"(((float *)(C_warp + (((i0_0_3 * 16) + (i1_0_4 * 8)) + 4)))[3]));
-            }
-#else
-  #pragma message("FP16 kernels will not be compiled for SM75-.")
-#endif
-          }
-        }
-      }
     }
   }
+  __pipeline_wait_prior(0);
+  pipe_calc_s3m1(A_shared, B_shared, A_shared_warp, B_shared_warp, C_warp, pre_load);
+
   for (int ax0_0_1 = 0; ax0_0_1 < 4; ++ax0_0_1)
   {
 
