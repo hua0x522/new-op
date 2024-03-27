@@ -6,14 +6,14 @@
 
 #define cdiv(x, y) (((x) + (y) - 1) / (y))
 
-__device__ void load_shm_A(half* shm_A, half* inputs, int* out_in_map, int n_points, int c_in, int ko) {
+__device__ void load_shm_A(half* shm_A, half* inputs, int* out_in_map, int kernel_size, int c_in, int ko) {
     // global layout: [128, 32]
     // shared layout: [64, 64]
     int tid = threadIdx.z * 64 + threadIdx.y * 32 + threadIdx.x;
     for (int i = 0; i < 4; i++) {
         int row = i * 32 + tid / 4;
         int col = tid % 4 * 8;
-        int row_A = out_in_map[(ko * 32 + col) / c_in * n_points + blockIdx.x * 128 + row];
+        int row_A = out_in_map[(blockIdx.x * 128 + row) * kernel_size + (ko * 32) / c_in];
         int col_A = (ko * 32 + col) % c_in;
         int shm_row = row / 2;
         int shm_col = col + (row & 1) * 32;
@@ -88,10 +88,10 @@ __device__ void store_C(uint32_t* reg_C, half* C, int M, int N) {
 }
 
 __device__ void pipe_load(half* shm_A, half* shm_B, half* inputs, half* weights, int* out_in_map, 
-                          int c_in, int c_out, int kernel_size, int n_points, int ko) {
+                          int c_in, int c_out, int kernel_size, int ko) {
     shm_A += (ko & 1) * 64 * 64;
     shm_B += (ko & 1) * 32 * 72;
-    load_shm_A(shm_A, inputs, out_in_map, n_points, c_in, ko);
+    load_shm_A(shm_A, inputs, out_in_map, kernel_size, c_in, ko);
     load_shm_B(shm_B, weights, c_in * kernel_size, c_out, ko);
 }
 
@@ -127,11 +127,11 @@ __global__ void flash_conv_kernel(half* inputs, half* weights, int* out_in_map, 
     uint32_t reg_B[4 * 2];
     uint32_t reg_C[4 * 4 * 4] = {0};
 
-    pipe_load(shm_A, shm_B, inputs, weights, out_in_map, c_in, c_out, kernel_size, n_points, 0);
+    pipe_load(shm_A, shm_B, inputs, weights, out_in_map, c_in, c_out, kernel_size, 0);
     __pipeline_commit();
 
     for (int ko = 1; ko < K / 32; ko++) {
-        pipe_load(shm_A, shm_B, inputs, weights, out_in_map, c_in, c_out, kernel_size, n_points, ko);
+        pipe_load(shm_A, shm_B, inputs, weights, out_in_map, c_in, c_out, kernel_size, ko);
         __pipeline_commit();
         __pipeline_wait_prior(1);
         pipe_calc(shm_A, shm_B, reg_A, reg_B, reg_C, ko - 1);
@@ -144,8 +144,8 @@ __global__ void flash_conv_kernel(half* inputs, half* weights, int* out_in_map, 
 torch::Tensor flash_conv_cuda(torch::Tensor inputs, torch::Tensor weights, torch::Tensor out_in_map) {
     int c_in = weights.size(1);
     int c_out = weights.size(2);
-    int n_points = out_in_map.size(1);
-    int kernel_size = out_in_map.size(0);
+    int n_points = out_in_map.size(0);
+    int kernel_size = out_in_map.size(1);
 
     auto options = torch::TensorOptions().dtype(inputs.dtype()).device(inputs.device());
     at::Tensor outputs = torch::empty({n_points, c_out}, options);
