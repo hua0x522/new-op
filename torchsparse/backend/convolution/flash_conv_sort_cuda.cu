@@ -70,11 +70,12 @@ __device__ void store_C_sort(uint32_t* reg_C, half* C, int* reorder_loc, int M, 
             int shm_col = threadIdx.y * 32 + n * 8 + (lane_id % 4) * 2;
             int row = shm_row + blockIdx.x * 128;
             int col = shm_col + blockIdx.y * 64;
+            int row_8 = reorder_loc[row + 8];
             row = reorder_loc[row];
             C[row * N + col] = __float2half(*(float*)&reg_C[m * 16 + n * 4]);
             C[row * N + col + 1] = __float2half(*(float*)&reg_C[m * 16 + n * 4 + 1]);
-            C[(row + 8) * N + col] = __float2half(*(float*)&reg_C[m * 16 + n * 4 + 2]);
-            C[(row + 8) * N + col + 1] = __float2half(*(float*)&reg_C[m * 16 + n * 4 + 3]);
+            C[row_8 * N + col] = __float2half(*(float*)&reg_C[m * 16 + n * 4 + 2]);
+            C[row_8 * N + col + 1] = __float2half(*(float*)&reg_C[m * 16 + n * 4 + 3]);
         }
     }
 }
