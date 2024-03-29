@@ -33,13 +33,14 @@ __device__ void load_shm_A_sort(half* shm_A, half* inputs, int* reorder_map, int
 }
 
 __device__ void load_shm_B_sort(half* shm_B, half* B, int K, int N, int ko) {
-    // layout: [32, 72]
+    // layout: [32, 64]
     int tid = threadIdx.z * 64 + threadIdx.y * 32 + threadIdx.x;
     for (int i = 0; i < 2; i++) {
         int row = i * 16 + tid / 8;
         int col = tid % 8 * 8;
+        int shm_col = col ^ ((row & 7) << 3);
         __pipeline_memcpy_async(
-            &shm_B[row * 72 + col],
+            &shm_B[row * 64 + shm_col],
             &B[(ko * 32 + row) * N + blockIdx.y * 64 + col],
             16
         );
@@ -65,7 +66,8 @@ __device__ void load_reg_B_sort(uint32_t* reg_B, half* shm_B, int ki) {
     for (int ni = 0; ni < 2; ni++) {
         int row = ki * 16 + lane_id % 16;
         int col = threadIdx.y * 32 + ni * 16 + lane_id / 16 * 8;
-        uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + row * 72 + col);
+        col = col ^ ((row & 7) << 3);
+        uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + row * 64 + col);
         LDMATRIX_X4_T(reg_B[ni * 4], reg_B[ni * 4 + 1], reg_B[ni * 4 + 2], reg_B[ni * 4 + 3], shm_B_lane_addr);
     }
 }
@@ -91,14 +93,14 @@ __device__ void store_C_sort(uint32_t* reg_C, half* C, int* reorder_loc, int M, 
 __device__ void pipe_load(half* shm_A, half* shm_B, half* inputs, half* weights, int* reorder_map, 
                           int kernel_size, int c_in, int N, int ko, int loc) {
     shm_A += loc * 64 * 64;
-    shm_B += loc * 32 * 72;
+    shm_B += loc * 32 * 64;
     load_shm_A_sort(shm_A, inputs, reorder_map, kernel_size, c_in, ko);
     load_shm_B_sort(shm_B, weights, kernel_size * c_in, N, ko);
 }
 
 __device__ void pipe_calc(half* shm_A, half* shm_B, uint32_t* reg_A, uint32_t* reg_B, uint32_t* reg_C, int ko, int loc) {
     shm_A += loc * 64 * 64;
-    shm_B += loc * 32 * 72;
+    shm_B += loc * 32 * 64;
     for (int ki = 0; ki < 2; ki++) {
         load_reg_A_sort(reg_A, shm_A, ki);
         load_reg_B_sort(reg_B, shm_B, ki);
@@ -122,7 +124,7 @@ __global__ void flash_conv_sort_kernel(half* inputs, half* weights, int* reorder
     int N = c_out;
     int K = kernel_size * c_in;
     __shared__ half shm_A[2 * 64 * 64];
-    __shared__ half shm_B[2 * 32 * 72];
+    __shared__ half shm_B[2 * 32 * 64];
 
     uint32_t reg_A[4 * 4];
     uint32_t reg_B[4 * 2];
