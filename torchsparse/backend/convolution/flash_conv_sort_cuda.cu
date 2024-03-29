@@ -2,6 +2,7 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include "ptx.h"
+#include <cuda_pipeline.h>
 
 #define cdiv(x, y) (((x) + (y) - 1) / (y))
 
@@ -21,7 +22,11 @@ __device__ void load_shm_A_sort(half* shm_A, half* inputs, int* reorder_map, int
             *(int4*)&shm_A[shm_row * 64 + shm_col] = make_int4(0, 0, 0, 0);
         } 
         else {
-            *(float4*)&shm_A[shm_row * 64 + shm_col] = *(float4*)&inputs[row_A * c_in + col_A];
+            __pipeline_memcpy_async(
+                &shm_A[shm_row * 64 + shm_col],
+                &inputs[row_A * c_in + col_A],
+                16
+            );
         }
     }
     __syncthreads();
@@ -33,7 +38,11 @@ __device__ void load_shm_B_sort(half* shm_B, half* B, int K, int N, int ko) {
     for (int i = 0; i < 2; i++) {
         int row = i * 16 + tid / 8;
         int col = tid % 8 * 8;
-        *(float4*)&shm_B[row * 72 + col] = *(float4*)&B[(ko * 32 + row) * N + blockIdx.y * 64 + col];
+        __pipeline_memcpy_async(
+            &shm_B[row * 72 + col],
+            &B[(ko * 32 + row) * N + blockIdx.y * 64 + col],
+            16
+        );
     }
     __syncthreads();
 }
@@ -49,7 +58,6 @@ __device__ void load_reg_A_sort(uint32_t* reg_A, half* shm_A, int ki) {
         uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + shm_row * 64 + shm_col);
         LDMATRIX_X4(reg_A[m * 4], reg_A[m * 4 + 1], reg_A[m * 4 + 2], reg_A[m * 4 + 3], shm_A_lane_addr);
     }
-    __syncthreads();
 }
 
 __device__ void load_reg_B_sort(uint32_t* reg_B, half* shm_B, int ki) {
@@ -80,41 +88,67 @@ __device__ void store_C_sort(uint32_t* reg_C, half* C, int* reorder_loc, int M, 
     }
 }
 
+__device__ void pipe_load(half* shm_A, half* shm_B, half* inputs, half* weights, int* reorder_map, 
+                          int kernel_size, int c_in, int N, int ko, int loc) {
+    shm_A += loc * 64 * 64;
+    shm_B += loc * 32 * 72;
+    load_shm_A_sort(shm_A, inputs, reorder_map, kernel_size, c_in, ko);
+    load_shm_B_sort(shm_B, weights, kernel_size * c_in, N, ko);
+}
+
+__device__ void pipe_calc(half* shm_A, half* shm_B, uint32_t* reg_A, uint32_t* reg_B, uint32_t* reg_C, int ko, int loc) {
+    shm_A += loc * 64 * 64;
+    shm_B += loc * 32 * 72;
+    for (int ki = 0; ki < 2; ki++) {
+        load_reg_A_sort(reg_A, shm_A, ki);
+        load_reg_B_sort(reg_B, shm_B, ki);
+
+        for (int m = 0; m < 4; m++) {
+            for (int n = 0; n < 4; n++) {
+                int idx = m * 4 + n;
+                HMMA16816(reg_C[idx * 4], reg_C[idx * 4 + 1], reg_C[idx * 4 + 2], reg_C[idx * 4 + 3],
+                    reg_A[m * 4], reg_A[m * 4 + 1], reg_A[m * 4 + 2], reg_A[m * 4 + 3],
+                    reg_B[n * 2], reg_B[n * 2 + 1],
+                    reg_C[idx * 4], reg_C[idx * 4 + 1], reg_C[idx * 4 + 2], reg_C[idx * 4 + 3]);
+            }
+        }
+    }
+}
+
 __global__ void flash_conv_sort_kernel(half* inputs, half* weights, int* reorder_map, int* reduced_mask, 
                                        int* reorder_loc, half* outputs, 
                                        int n_points, int c_in, int c_out, int kernel_size) {
     int M = n_points;
     int N = c_out;
     int K = kernel_size * c_in;
-    __shared__ half shm_A[64 * 64];
-    __shared__ half shm_B[32 * 72];
+    __shared__ half shm_A[2 * 64 * 64];
+    __shared__ half shm_B[2 * 32 * 72];
 
     uint32_t reg_A[4 * 4];
     uint32_t reg_B[4 * 2];
     uint32_t reg_C[4 * 4 * 4] = {0};
 
-    for (int ko = 0; ko < K / 32; ko++) {
+    pipe_load(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, 0, 0);
+    __pipeline_commit();
+    int pre_load = 0;
+    int pipe_loc = 0;
+
+    for (int ko = 1; ko < K / 32; ko++) {
         bool flag = reduced_mask[blockIdx.x] & (1 << (ko * 32 / c_in));
         if (flag) {
-            load_shm_A_sort(shm_A, inputs, reorder_map, kernel_size, c_in, ko);
-            load_shm_B_sort(shm_B, weights, K, N, ko);
-    
-            for (int ki = 0; ki < 2; ki++) {
-                load_reg_A_sort(reg_A, shm_A, ki);
-                load_reg_B_sort(reg_B, shm_B, ki);
-    
-                for (int m = 0; m < 4; m++) {
-                    for (int n = 0; n < 4; n++) {
-                        int idx = m * 4 + n;
-                        HMMA16816(reg_C[idx * 4], reg_C[idx * 4 + 1], reg_C[idx * 4 + 2], reg_C[idx * 4 + 3],
-                            reg_A[m * 4], reg_A[m * 4 + 1], reg_A[m * 4 + 2], reg_A[m * 4 + 3],
-                            reg_B[n * 2], reg_B[n * 2 + 1],
-                            reg_C[idx * 4], reg_C[idx * 4 + 1], reg_C[idx * 4 + 2], reg_C[idx * 4 + 3]);
-                    }
-                }
-            }
+            pipe_load(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, ko, pipe_loc ^ 1);
+            __pipeline_commit();
+            __pipeline_wait_prior(1);
+            pipe_calc(shm_A, shm_B, reg_A, reg_B, reg_C, pre_load, pipe_loc);
+            __syncthreads();
+            pre_load = ko;
+            pipe_loc = pipe_loc ^ 1;
         }
     }
+
+    __pipeline_wait_prior(0);
+    pipe_calc(shm_A, shm_B, reg_A, reg_B, reg_C, pre_load, pipe_loc);
+
     store_C_sort(reg_C, outputs, reorder_loc, M, N);
 }
 
