@@ -82,10 +82,14 @@ __device__ void store_C_s2(uint32_t* reg_C, half* C, int* reorder_loc, int M, in
             int col = shm_col + blockIdx.y * 64;
             int row_8 = reorder_loc[row + 8];
             row = reorder_loc[row];
-            C[row * N + col] = __float2half(*(float*)&reg_C[m * 16 + n * 4]);
-            C[row * N + col + 1] = __float2half(*(float*)&reg_C[m * 16 + n * 4 + 1]);
-            C[row_8 * N + col] = __float2half(*(float*)&reg_C[m * 16 + n * 4 + 2]);
-            C[row_8 * N + col + 1] = __float2half(*(float*)&reg_C[m * 16 + n * 4 + 3]);
+            if (row < M) {
+                C[row * N + col] = __float2half(*(float*)&reg_C[m * 16 + n * 4]);
+                C[row * N + col + 1] = __float2half(*(float*)&reg_C[m * 16 + n * 4 + 1]);
+            }
+            if (row_8 < M) {
+                C[row_8 * N + col] = __float2half(*(float*)&reg_C[m * 16 + n * 4 + 2]);
+                C[row_8 * N + col + 1] = __float2half(*(float*)&reg_C[m * 16 + n * 4 + 3]);
+            }
         }
     }
 }
@@ -157,10 +161,10 @@ __global__ void flash_conv_sort_s2_kernel(half* inputs, half* weights, int* reor
 }
 
 torch::Tensor flash_conv_sort_s2_cuda(torch::Tensor inputs, torch::Tensor weights, torch::Tensor reorder_map,
-                              torch::Tensor reduced_mask, torch::Tensor reorder_loc) {
+                              torch::Tensor reduced_mask, torch::Tensor reorder_loc, int num_out_feats) {
     int c_in = weights.size(1);
     int c_out = weights.size(2);
-    int n_points = reorder_map.size(0);
+    int n_points = num_out_feats;
     int kernel_size = reorder_map.size(1);
 
     auto options = torch::TensorOptions().dtype(inputs.dtype()).device(inputs.device());

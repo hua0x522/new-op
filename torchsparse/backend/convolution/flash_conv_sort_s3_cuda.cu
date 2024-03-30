@@ -123,8 +123,8 @@ __global__ void flash_conv_sort_s3_kernel(half* inputs, half* weights, int* reor
     int M = n_points;
     int N = c_out;
     int K = kernel_size * c_in;
-    __shared__ half shm_A[2 * 64 * 64];
-    __shared__ half shm_B[2 * 32 * 64];
+    __shared__ half shm_A[3 * 64 * 64];
+    __shared__ half shm_B[3 * 32 * 64];
 
     uint32_t reg_A[4 * 4];
     uint32_t reg_B[4 * 2];
@@ -132,13 +132,15 @@ __global__ void flash_conv_sort_s3_kernel(half* inputs, half* weights, int* reor
 
     pipe_load_s3(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, 0, 0);
     __pipeline_commit();
+    pipe_load_s3(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, 1, 1);
+    __pipeline_commit();
     int idx0 = 0;
     int idx1 = 1;
     int loc0 = 0;
     int loc1 = 1;
     int loc2;
 
-    for (int ko = 1; ko < K / 32; ko++) {
+    for (int ko = 2; ko < K / 32; ko++) {
         bool flag = reduced_mask[blockIdx.x] & (1 << (ko * 32 / c_in));
         if (flag) {
             loc2 = (loc1 + 1) % 3;
