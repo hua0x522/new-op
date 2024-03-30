@@ -9,6 +9,8 @@
 #include "others/reduce_bitmask_cuda.h"
 #include "convolution/flash_conv_cuda.h"
 #include "convolution/flash_conv_sort_cuda.h"
+#include "convolution/flash_conv_sort_s2_cuda.h"
+#include "convolution/flash_conv_sort_s3_cuda.h"
 // #include "others/downsample_kmap_cuda.h"
 // #include "others/subm_kmap_cuda.h"
 
@@ -23,4 +25,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("reduce_bitmask_cuda", &reduce_bitmask_cuda);
   m.def("flash_conv_cuda", &flash_conv_cuda);
   m.def("flash_conv_sort_cuda", &flash_conv_sort_cuda);
+  m.def("flash_conv_sort_s2_cuda", &flash_conv_sort_cuda);
+  m.def("flash_conv_sort_s3_cuda", &flash_conv_sort_cuda);
 }
