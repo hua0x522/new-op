@@ -7,17 +7,15 @@
 #define cdiv(x, y) (((x) + (y) - 1) / (y))
 
 __device__ void load_shm_A_s1(half* shm_A, half* inputs, int* reorder_map, int kernel_size, int c_in, int ko) {
-    // global layout: [128, 32]
-    // shared layout: [64, 64]
+    // layout: [128, 64]
     int tid = threadIdx.z * 64 + threadIdx.y * 32 + threadIdx.x;
-    for (int i = 0; i < 4; i++) {
-        int row = i * 32 + tid / 4;
-        int col = tid % 4 * 8;
-        int row_A = reorder_map[(blockIdx.x * 128 + row) * kernel_size + (ko * 32) / c_in];
-        int col_A = (ko * 32 + col) % c_in;
-        int shm_row = row / 2;
-        int shm_col = col + (row & 1) * 32;
-        shm_col = shm_col ^ ((shm_row & 3) << 3);
+    for (int i = 0; i < 8; i++) {
+        int row = i * 16 + tid / 8;
+        int col = tid % 8 * 8;
+        int row_A = reorder_map[(blockIdx.x * 128 + row) * kernel_size + (ko * 64) / c_in];
+        int col_A = (ko * 64 + col) % c_in;
+        int shm_row = row;
+        int shm_col = col ^ ((shm_row & 7) << 3);
         if (row_A == -1) {
             *(int4*)&shm_A[shm_row * 64 + shm_col] = make_int4(0, 0, 0, 0);
         } 
@@ -33,15 +31,15 @@ __device__ void load_shm_A_s1(half* shm_A, half* inputs, int* reorder_map, int k
 }
 
 __device__ void load_shm_B_s1(half* shm_B, half* B, int K, int N, int ko) {
-    // layout: [32, 64]
+    // layout: [64, 64]
     int tid = threadIdx.z * 64 + threadIdx.y * 32 + threadIdx.x;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         int row = i * 16 + tid / 8;
         int col = tid % 8 * 8;
         int shm_col = col ^ ((row & 7) << 3);
         __pipeline_memcpy_async(
             &shm_B[row * 64 + shm_col],
-            &B[(ko * 32 + row) * N + blockIdx.y * 64 + col],
+            &B[(ko * 64 + row) * N + blockIdx.y * 64 + col],
             16
         );
     }
@@ -53,9 +51,8 @@ __device__ void load_reg_A_s1(uint32_t* reg_A, half* shm_A, int ki) {
         int lane_id = threadIdx.x;
         int row = threadIdx.z * 64 + m * 16 + lane_id % 16;
         int col = ki * 16 + lane_id / 16 * 8;
-        int shm_row = row / 2;
-        int shm_col = col + (row & 1) * 32;
-        shm_col = shm_col ^ ((shm_row & 3) << 3);
+        int shm_row = row;
+        int shm_col = col ^ ((shm_row & 7) << 3);
         uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + shm_row * 64 + shm_col);
         LDMATRIX_X4(reg_A[m * 4], reg_A[m * 4 + 1], reg_A[m * 4 + 2], reg_A[m * 4 + 3], shm_A_lane_addr);
     }
@@ -97,7 +94,7 @@ __device__ void pipe_load_s1(half* shm_A, half* shm_B, half* inputs, half* weigh
 }
 
 __device__ void pipe_calc_s1(half* shm_A, half* shm_B, uint32_t* reg_A, uint32_t* reg_B, uint32_t* reg_C, int ko) {
-    for (int ki = 0; ki < 2; ki++) {
+    for (int ki = 0; ki < 4; ki++) {
         load_reg_A_s1(reg_A, shm_A, ki);
         load_reg_B_s1(reg_B, shm_B, ki);
 
@@ -119,15 +116,15 @@ __global__ void flash_conv_sort_kernel(half* inputs, half* weights, int* reorder
     int M = n_points;
     int N = c_out;
     int K = kernel_size * c_in;
-    __shared__ half shm_A[64 * 64];
-    __shared__ half shm_B[32 * 64];
+    __shared__ half shm_A[128 * 64];
+    __shared__ half shm_B[64 * 64];
 
     uint32_t reg_A[4 * 4];
     uint32_t reg_B[4 * 2];
     uint32_t reg_C[4 * 4 * 4] = {0};
 
-    for (int ko = 0; ko < K / 32; ko++) {
-        bool flag = reduced_mask[blockIdx.x] & (1 << (ko * 32 / c_in));
+    for (int ko = 0; ko < K / 64; ko++) {
+        bool flag = reduced_mask[blockIdx.x] & (1 << (ko * 64 / c_in));
         if (flag) {
             pipe_load_s1(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, ko);
             __pipeline_commit();
