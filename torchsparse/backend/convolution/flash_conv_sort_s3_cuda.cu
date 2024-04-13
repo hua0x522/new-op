@@ -1,4 +1,4 @@
-#include "flash_conv_sort_cuda.h"
+#include "flash_conv_sort_s3_cuda.h"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include "ptx.h"
