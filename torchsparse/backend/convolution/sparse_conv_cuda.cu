@@ -90,12 +90,24 @@ __device__ void store_C_k64n64(uint32_t* reg_C, half* C, int* reorder_loc, int M
 }
 
 __device__ void pipe_load_k64n64(half* shm_A, half* shm_B, half* inputs, half* weights, int* reorder_map, 
-                          int kernel_size, int c_in, int N, int ko) {
+                          int kernel_size, int c_in, int N, int ko, int loc) {
+    shm_A += loc * 128 * 64;
+    shm_B += loc * 64 * 64;
     load_shm_A_k64n64(shm_A, inputs, reorder_map, kernel_size, c_in, ko);
     load_shm_B_k64n64(shm_B, weights, kernel_size * c_in, N, ko);
 }
 
-__device__ void pipe_calc_k64n64(half* shm_A, half* shm_B, uint32_t* reg_A, uint32_t* reg_B, uint32_t* reg_C, int mma_flag) {
+__device__ void pipe_calc_k64n64(half* shm_A, half* shm_B, uint32_t* reg_A, uint32_t* reg_B, uint32_t* reg_C, 
+                                 int* mma_mask, int c_in, int ko, int loc) {
+    shm_A += loc * 128 * 64;
+    shm_B += loc * 64 * 64;
+    int mma_flag = 0;
+    for (int i = 0; i < 8; i++) {
+        if (mma_mask[blockIdx.x * 8 + i] & (1 << (ko * 64 / c_in))) {
+            mma_flag = mma_flag + (1 << i); 
+        }
+    }
+    
     for (int ki = 0; ki < 4; ki++) {
         // load_reg_A_k64n64(reg_A, shm_A, ki);
         load_reg_B_k64n64(reg_B, shm_B, ki);
@@ -125,29 +137,48 @@ __global__ void sparse_conv_k64n64(half* inputs, half* weights, int* reorder_map
     int M = n_points;
     int N = c_out;
     int K = kernel_size * c_in;
-    __shared__ half shm_A[128 * 64];
-    __shared__ half shm_B[64 * 64];
+    __shared__ half shm_A[2 * 128 * 64];
+    __shared__ half shm_B[2 * 64 * 64];
 
     uint32_t reg_A[4 * 8 * 4];
     uint32_t reg_B[4 * 2 * 2];
     uint32_t reg_C[8 * 2 * 4] = {0};
 
-    for (int ko = 0; ko < K / 64; ko++) {
+    int ko;
+    int idx0, idx1;
+    int loc0, loc1;
+    for (ko = 0; ko < K / 64; ko++) {
         bool flag = reduced_mask[blockIdx.x] & (1 << (ko * 64 / c_in));
         if (flag) {
-            int mma_flag = 0;
-            for (int i = 0; i < 8; i++) {
-                if (mma_mask[blockIdx.x * 8 + i] & (1 << (ko * 64 / c_in))) {
-                    mma_flag = mma_flag + (1 << i); 
-                }
-            }
-            pipe_load_k64n64(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, ko);
+            idx1 = ko;
+            loc1 = 0;
+            pipe_load_k64n64(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, idx1, loc1);
             __pipeline_commit();
-            __pipeline_wait_prior(0);
-            pipe_calc_k64n64(shm_A, shm_B, reg_A, reg_B, reg_C, mma_flag);
-            __syncthreads();
+            break;
         }
     }
+
+    if (ko < K / 64) {
+        for (ko += 1; ko < K / 64; ko++) {
+            bool flag = reduced_mask[blockIdx.x] & (1 << (ko * 64 / c_in));
+            if (flag) {
+                idx0 = idx1;
+                loc0 = loc1;
+                idx1 = ko;
+                loc1 = loc0 ^ 1;
+                pipe_load_k64n64(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, idx1, loc1);
+                __pipeline_commit();
+                __pipeline_wait_prior(1);
+                pipe_calc_k64n64(shm_A, shm_B, reg_A, reg_B, reg_C, mma_mask, c_in, idx0, loc0);
+                __syncthreads();
+            }
+        }
+
+        __pipeline_wait_prior(0);
+        pipe_calc_k64n64(shm_A, shm_B, reg_A, reg_B, reg_C, mma_mask, c_in, idx1, loc1);
+        __syncthreads();
+    }
+
     store_C_k64n64(reg_C, outputs, reorder_loc, M, N);
 }
 
