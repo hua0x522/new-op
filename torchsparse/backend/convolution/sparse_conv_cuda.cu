@@ -4,6 +4,9 @@
 #include "ptx.h"
 #include <cuda_pipeline.h>
 
+namespace sparse_conv
+{
+
 #define cdiv(x, y) (((x) + (y) - 1) / (y))
 
 __device__ void load_shm_A_k64n64(half* shm_A, half* inputs, int* reorder_map, int kernel_size, int c_in, int ko) {
@@ -151,6 +154,8 @@ __global__ void sparse_conv_k64n64(half* inputs, half* weights, int* reorder_map
     store_C_k64n64(reg_C, outputs, reorder_loc, M, N);
 }
 
+}
+
 torch::Tensor sparse_conv_cuda(torch::Tensor inputs, torch::Tensor weights, torch::Tensor reorder_map, 
                                torch::Tensor reduced_mask, torch::Tensor mma_mask, torch::Tensor reorder_loc, 
                                int num_out_feats) {
@@ -172,8 +177,8 @@ torch::Tensor sparse_conv_cuda(torch::Tensor inputs, torch::Tensor weights, torc
 
     dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
     dim3 num_threads(32, 4);
-    sparse_conv_k64n64<<<num_blocks, num_threads>>>
-                      (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, mma_mask_ptr, reorder_loc_ptr,
-                      outputs_ptr, n_points, c_in, c_out, kernel_size);
+    sparse_conv::sparse_conv_k64n64<<<num_blocks, num_threads>>>
+                (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, mma_mask_ptr, reorder_loc_ptr,
+                outputs_ptr, n_points, c_in, c_out, kernel_size);
     return outputs;
 }

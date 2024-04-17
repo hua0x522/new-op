@@ -4,6 +4,8 @@
 #include "ptx.h"
 #include <cuda_pipeline.h>
 
+namespace flash_conv
+{
 #define cdiv(x, y) (((x) + (y) - 1) / (y))
 
 __device__ void load_shm_A_k32n32(half* shm_A, half* inputs, int* reorder_map, int kernel_size, int c_in, int ko) {
@@ -621,6 +623,7 @@ __global__ void flash_conv_sort_m64(half* inputs, half* weights, int* reorder_ma
 
     store_C_m64(reg_C, outputs, reorder_loc, M, N);
 }
+}
 
 torch::Tensor flash_conv_sort_cuda(torch::Tensor inputs, torch::Tensor weights, torch::Tensor reorder_map,
                               torch::Tensor reduced_mask, torch::Tensor reorder_loc, int num_out_feats) {
@@ -639,32 +642,32 @@ torch::Tensor flash_conv_sort_cuda(torch::Tensor inputs, torch::Tensor weights, 
     half* weights_ptr = reinterpret_cast<half*>(weights.data_ptr<at::Half>());
     half* outputs_ptr = reinterpret_cast<half*>(outputs.data_ptr<at::Half>());
 
-    dim3 num_blocks(cdiv(n_points, 64), cdiv(c_out, 64));
-    dim3 num_threads(32, 2, 2);
-    flash_conv_sort_m64<<<num_blocks, num_threads>>>
-                      (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
-                      outputs_ptr, n_points, c_in, c_out, kernel_size);
+    // dim3 num_blocks(cdiv(n_points, 64), cdiv(c_out, 64));
+    // dim3 num_threads(32, 2, 2);
+    // flash_conv_sort_m64<<<num_blocks, num_threads>>>
+    //                   (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
+    //                   outputs_ptr, n_points, c_in, c_out, kernel_size);
 
-    // if (c_in % 64 == 0 && c_out % 64 == 0) {
-    //     dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
-    //     dim3 num_threads(32, 2, 2);
-    //     flash_conv_sort_k64n64<<<num_blocks, num_threads>>>
-    //                       (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
-    //                       outputs_ptr, n_points, c_in, c_out, kernel_size);
-    // }
-    // else if (c_in % 32 == 0 && c_out % 64 == 0) {
-    //     dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
-    //     dim3 num_threads(32, 2, 2);
-    //     flash_conv_sort_k32n64<<<num_blocks, num_threads>>>
-    //                       (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
-    //                       outputs_ptr, n_points, c_in, c_out, kernel_size);
-    // }
-    // else if (c_in % 32 == 0 && c_out % 32 == 0) {
-    //     dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 32));
-    //     dim3 num_threads(32, 2, 2);
-    //     flash_conv_sort_k32n32<<<num_blocks, num_threads>>>
-    //                         (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
-    //                         outputs_ptr, n_points, c_in, c_out, kernel_size);
-    // }
+    if (c_in % 64 == 0 && c_out % 64 == 0) {
+        dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
+        dim3 num_threads(32, 2, 2);
+        flash_conv::flash_conv_sort_k64n64<<<num_blocks, num_threads>>>
+                          (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
+                          outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    else if (c_in % 32 == 0 && c_out % 64 == 0) {
+        dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
+        dim3 num_threads(32, 2, 2);
+        flash_conv::flash_conv_sort_k32n64<<<num_blocks, num_threads>>>
+                          (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
+                          outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    else if (c_in % 32 == 0 && c_out % 32 == 0) {
+        dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 32));
+        dim3 num_threads(32, 2, 2);
+        flash_conv::flash_conv_sort_k32n32<<<num_blocks, num_threads>>>
+                            (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
+                            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
     return outputs;
 }
