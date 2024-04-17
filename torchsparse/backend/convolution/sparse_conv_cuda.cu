@@ -101,12 +101,17 @@ __device__ void store_C_k32n64(uint32_t* reg_C, half* C, int* reorder_loc, int M
 }
 
 __device__ void pipe_load_k32n64(half* shm_A, half* shm_B, half* inputs, half* weights, int* reorder_map, 
-                          int kernel_size, int c_in, int N, int ko) {
+                          int kernel_size, int c_in, int N, int ko, int loc) {
+    shm_A += loc * 128 * 32;
+    shm_B += loc * 32 * 64;
     load_shm_A_k32n64(shm_A, inputs, reorder_map, kernel_size, c_in, ko);
     load_shm_B_k32n64(shm_B, weights, kernel_size * c_in, N, ko);
 }
 
-__device__ void pipe_calc_k32n64(half* shm_A, half* shm_B, uint32_t* reg_A, uint32_t* reg_B, uint32_t* reg_C, int mma_flag) {
+__device__ void pipe_calc_k32n64(half* shm_A, half* shm_B, uint32_t* reg_A, uint32_t* reg_B, uint32_t* reg_C, int mma_flag, int ko, int loc) {
+    shm_A += loc * 128 * 32;
+    shm_B += loc * 32 *64;
+    
     for (int ki = 0; ki < 2; ki++) {
         load_reg_B_k32n64(reg_B, shm_B, ki);
     }
@@ -135,29 +140,61 @@ __global__ void sparse_conv_k32n64(half* inputs, half* weights, int* reorder_map
     int M = n_points;
     int N = c_out;
     int K = kernel_size * c_in;
-    __shared__ half shm_A[128 * 32];
-    __shared__ half shm_B[32 * 64];
+    __shared__ half shm_A[2 * 128 * 32];
+    __shared__ half shm_B[2 * 32 * 64];
 
     uint32_t reg_A[2 * 8 * 4];
     uint32_t reg_B[2 * 2 * 2];
     uint32_t reg_C[8 * 2 * 4] = {0};
 
-    for (int ko = 0; ko < K / 32; ko++) {
+    int ko;
+    int idx0, idx1;
+    int loc0, loc1;
+
+    for (ko = 0; ko < K / 32; ko++) {
         bool flag = reduced_mask[blockIdx.x] & (1 << (ko * 32 / c_in));
         if (flag) {
-            int mma_flag = 0;
-            for (int i = 0; i < 8; i++) {
-                if (mma_mask[blockIdx.x * 8 + i] & (1 << (ko * 32 / c_in))) {
-                    mma_flag = mma_flag + (1 << i); 
-                }
-            }
-            pipe_load_k32n64(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, ko);
+            idx1 = ko;
+            loc1 = 0;
+            pipe_load_k32n64(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, idx1, loc1);
             __pipeline_commit();
-            __pipeline_wait_prior(0);
-            pipe_calc_k32n64(shm_A, shm_B, reg_A, reg_B, reg_C, mma_flag);
-            __syncthreads();
+            break;
         }
     }
+
+    if (ko < K / 32) {
+        for (ko += 1; ko < K / 32; ko++) {
+            bool flag = reduced_mask[blockIdx.x] & (1 << (ko * 32 / c_in));
+            if (flag) {
+                idx0 = idx1;
+                loc0 = loc1;
+                idx1 = ko;
+                loc1 = loc0 ^ 1;
+                int mma_flag = 0;
+                for (int i = 0; i < 8; i++) {
+                    if (mma_mask[blockIdx.x * 8 + i] & (1 << (idx0 * 32 / c_in))) {
+                        mma_flag = mma_flag + (1 << i); 
+                    }
+                }
+                pipe_load_k32n64(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, idx1, loc1);
+                __pipeline_commit();
+                __pipeline_wait_prior(1);
+                pipe_calc_k32n64(shm_A, shm_B, reg_A, reg_B, reg_C, mma_flag, idx0, loc0);
+                __syncthreads();
+            }
+        }
+
+        __pipeline_wait_prior(0);
+        int mma_flag = 0;
+        for (int i = 0; i < 8; i++) {
+            if (mma_mask[blockIdx.x * 8 + i] & (1 << (idx1 * 32 / c_in))) {
+                mma_flag = mma_flag + (1 << i); 
+            }
+        }
+        pipe_calc_k32n64(shm_A, shm_B, reg_A, reg_B, reg_C, mma_flag, idx1, loc1);
+        __syncthreads();
+    }
+
     store_C_k32n64(reg_C, outputs, reorder_loc, M, N);
 }
 
