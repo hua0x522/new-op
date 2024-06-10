@@ -157,13 +157,7 @@ __global__ void sparse_conv2_kernel(half* inputs, half* weights, int* reorder_ma
     for (int ko = 0; ko < K / 64; ko++) {
         bool flag = reduced_mask[blockIdx.x] & (1 << (ko * 64 / c_in));
         if (flag) {
-            int mma_flag = 0;
-            for (int i = 0; i < 8; i++) {
-                if (mma_mask[blockIdx.x * 8 + i] & (1 << (ko * 64 / c_in))) {
-                    mma_flag = mma_flag + (1 << i);
-                }
-            }
-
+            int mma_flag = mma_mask[blockIdx.x * kernel_size + (ko * 64 / c_in)];
             pipe_load(shm_A, shm_B, inputs, weights, reorder_map, kernel_size, c_in, N, ko);
             __pipeline_commit();
             __pipeline_wait_prior(0);
