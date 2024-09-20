@@ -1,14 +1,8 @@
-#include "sparse_conv2_cuda.h"
+#include "all_kernels.h"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include "ptx.h"
 #include <cuda_pipeline.h>
-
-void check_cuda(cudaError_t status) {
-    if (status != cudaSuccess) {
-        printf("CUDA API failed at line %d with error: %s(%d)\n", __LINE__, cudaGetErrorString(status), status);
-    }
-}
 
 namespace sparse_conv2
 {
@@ -193,12 +187,6 @@ torch::Tensor sparse_conv2_cuda(torch::Tensor inputs, torch::Tensor weights, tor
     half* weights_ptr = reinterpret_cast<half*>(weights.data_ptr<at::Half>());
     half* outputs_ptr = reinterpret_cast<half*>(outputs.data_ptr<at::Half>());
 
-    // dim3 num_blocks(cdiv(n_points, 64), cdiv(c_out, 64));
-    // dim3 num_threads(32, 2, 2);
-    // flash_conv_sort_m64<<<num_blocks, num_threads>>>
-    //                   (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
-    //                   outputs_ptr, n_points, c_in, c_out, kernel_size);
-
     if (c_in % 64 == 0 && c_out % 64 == 0) {
         dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
         dim3 num_threads(32, 2, 2);
@@ -206,19 +194,84 @@ torch::Tensor sparse_conv2_cuda(torch::Tensor inputs, torch::Tensor weights, tor
                     (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, mma_mask_ptr, reorder_loc_ptr,
                 outputs_ptr, n_points, c_in, c_out, kernel_size);
     }
-    // else if (c_in % 32 == 0 && c_out % 64 == 0) {
-    //     dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
-    //     dim3 num_threads(32, 2, 2);
-    //     flash_conv::flash_conv_sort_k32n64<<<num_blocks, num_threads>>>
-    //                       (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
-    //                       outputs_ptr, n_points, c_in, c_out, kernel_size);
-    // }
-    // else if (c_in % 32 == 0 && c_out % 32 == 0) {
-    //     dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 32));
-    //     dim3 num_threads(32, 2, 2);
-    //     flash_conv::flash_conv_sort_k32n32<<<num_blocks, num_threads>>>
-    //                         (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
-    //                         outputs_ptr, n_points, c_in, c_out, kernel_size);
-    // }
     return outputs;
+}
+
+
+
+
+__global__ void reduced_mask_kernel(int* reduced_mask, int* bitmask, int n_points) {
+    int idx = threadIdx.x + blockIdx.x * 32;
+    if (idx < n_points / 16) {
+        int mask = 0;
+        for (int i = 0; i < 16; i++) {
+            mask = mask | bitmask[idx * 16 + i];
+        }
+        reduced_mask[idx] = mask;
+    }
+}
+
+__global__ void mma_mask_kernel(int* mma_mask, int* reduced_mask, int n_points, int kernel_volume) {
+    int idx = threadIdx.x + blockIdx.x * 32;
+    if (idx < n_points / 128) {
+        int mask = 0;
+        for (int i = 0; i < 8; i++) {
+            if (reduced_mask[idx * 8 + i] & (1 << blockIdx.y)) {
+                mask += 1 << i;
+            }
+        }
+        mma_mask[idx * kernel_volume + blockIdx.y] = mask;
+    }
+}
+
+torch::Tensor mma_mask_cuda(torch::Tensor bitmask, int kernel_volume) {
+    int* bitmask_ptr = bitmask.data_ptr<int>();
+    auto options = torch::TensorOptions().dtype(bitmask.dtype()).device(bitmask.device());
+    int n_points = bitmask.size(1);
+    at::Tensor reduced_mask = torch::empty({n_points / 16}, options);
+    at::Tensor mma_mask = torch::empty({n_points / 128, kernel_volume}, options);
+    int* reduced_mask_ptr = reduced_mask.data_ptr<int>();
+    int* mma_mask_ptr = mma_mask.data_ptr<int>();
+
+    dim3 num_blocks_0(cdiv(n_points / 16, 32));
+    dim3 num_threads_0(32);
+    reduced_mask_kernel<<<num_blocks_0, num_threads_0>>>(reduced_mask_ptr, bitmask_ptr, n_points);
+    
+    dim3 num_blocks_1(cdiv(n_points / 128, 32), kernel_volume);
+    dim3 num_threads_1(32);
+    mma_mask_kernel<<<num_blocks_1, num_threads_1>>>(mma_mask_ptr, reduced_mask_ptr, n_points, kernel_volume);
+    
+    return mma_mask;
+}
+
+
+__global__ void gray_mask_kernel(int* gray_mask, int* bitmask, int m, int n) {
+    int idx = threadIdx.x + blockIdx.x * 128;
+    int bit_val = bitmask[idx];
+    int bit = (bit_val >> (n - 1)) & 1;
+    int gray_val = bit << (n - 1);
+    int last_bit = bit;
+
+    for (int i = n - 2; i >= 0; i--) {
+        bit = (bitmask[idx] >> i) & 1;
+        gray_val += (bit ^ last_bit) << i;
+        last_bit = bit;
+    }
+
+    gray_mask[idx] = gray_val;
+}
+
+torch::Tensor gray_mask_cuda(torch::Tensor bitmask, int kernel_volume) {
+    int* bitmask_ptr = bitmask.data_ptr<int>();
+    int m = bitmask.size(1);
+    int n = kernel_volume;
+    auto options = torch::TensorOptions().dtype(bitmask.dtype()).device(bitmask.device());
+    at::Tensor gray_mask = torch::empty({1, m}, options);
+    int* gray_mask_ptr = gray_mask.data_ptr<int>();
+    
+    dim3 num_blocks(cdiv(m, 128));
+    dim3 num_threads(128);
+    gray_mask_kernel<<<num_blocks, num_threads>>>(gray_mask_ptr, bitmask_ptr, m, n);
+    
+    return gray_mask;
 }
