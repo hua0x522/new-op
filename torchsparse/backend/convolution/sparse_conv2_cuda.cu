@@ -65,15 +65,13 @@ __device__ void load_shm_B(half* shm_B, half* B, int K, int N, int ko) {
 }
 
 __device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int ki, int m) {
-    for (int m = 0; m < 4; m++) {
-        int lane_id = threadIdx.x;
-        int row = threadIdx.z * 64 + m * 16 + lane_id % 16;
-        int col = ki * 16 + lane_id / 16 * 8;
-        int shm_row = row;
-        int shm_col = col ^ ((shm_row & 7) << 3);
-        uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + shm_row * 64 + shm_col);
-        LDMATRIX_X4(reg_A[ki * 16 + m * 4], reg_A[ki * 16 + m * 4 + 1], reg_A[ki * 16 + m * 4 + 2], reg_A[ki * 16 + m * 4 + 3], shm_A_lane_addr);
-    }
+    int lane_id = threadIdx.x;
+    int row = threadIdx.z * 64 + m * 16 + lane_id % 16;
+    int col = ki * 16 + lane_id / 16 * 8;
+    int shm_row = row;
+    int shm_col = col ^ ((shm_row & 7) << 3);
+    uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + shm_row * 64 + shm_col);
+    LDMATRIX_X4(reg_A[ki * 16 + m * 4], reg_A[ki * 16 + m * 4 + 1], reg_A[ki * 16 + m * 4 + 2], reg_A[ki * 16 + m * 4 + 3], shm_A_lane_addr);
 }
 
 __device__ void load_reg_B(uint32_t* reg_B, half* shm_B, int ki) {

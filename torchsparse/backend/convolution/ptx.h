@@ -44,3 +44,27 @@
 #define CP_ASYNC_WAIT_GROUP(N) asm volatile("cp.async.wait_group %0;\n" ::"n"(N))
 
 #define CP_ASYNC_WAIT_ALL() asm volatile("cp.async.wait_all;\n" ::)
+
+#define pipe_memcpy(dst, src) \
+    { \
+    uint32_t smem_ptr; \
+    asm(    \
+        "{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"  \
+            : "=r"(smem_ptr)    \
+            : "l"(dst));    \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" ::"r"(smem_ptr), \
+                     "l"(src),   \
+                     "n"(16));   \
+    }
+
+#define pipe_memcpy_zero(dst, src) \
+    {   \
+    uint32_t smem_ptr; \
+    asm(    \
+        "{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"  \
+            : "=r"(smem_ptr)    \
+            : "l"(dst));    \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], %2, ignore-src;\n" ::"r"(smem_ptr), \
+                     "l"(src),   \
+                     "n"(16));   \
+    }

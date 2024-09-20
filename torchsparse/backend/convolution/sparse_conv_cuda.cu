@@ -4,6 +4,15 @@
 #include "ptx.h"
 #include <cuda_pipeline.h>
 
+#define CHECK_CUDA(func) \
+{   \
+    cudaError_t status = (func); \
+    if (status != cudaSuccess) { \
+        printf("CUDA API failed at line %d with error: %s (%d)\n", \
+        __LINE__, cudaGetErrorString(status), status); \
+    } \
+}
+
 namespace sparse_conv
 {
 
@@ -555,7 +564,7 @@ torch::Tensor sparse_conv_cuda(torch::Tensor inputs, torch::Tensor weights, torc
     sparse_conv::m128k64n64::sparse_conv_kernel<<<num_blocks, num_threads>>>
                 (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, mma_mask_ptr, reorder_loc_ptr,
                 outputs_ptr, n_points, c_in, c_out, kernel_size);
-
+    CHECK_CUDA(cudaGetLastError());
     // dim3 num_blocks(cdiv(n_points, 64), cdiv(c_out, 64));
     // dim3 num_threads(32, 4);
     // sparse_conv::m64k32n64::sparse_conv_kernel<<<num_blocks, num_threads>>>
