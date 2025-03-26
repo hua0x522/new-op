@@ -648,21 +648,21 @@ torch::Tensor flash_conv_sort_cuda(torch::Tensor inputs, torch::Tensor weights, 
     //                   (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
     //                   outputs_ptr, n_points, c_in, c_out, kernel_size);
 
-    if (c_in % 64 == 0 && c_out % 64 == 0) {
-        dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
-        dim3 num_threads(32, 2, 2);
-        flash_conv::flash_conv_sort_k64n64<<<num_blocks, num_threads>>>
-                          (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
-                          outputs_ptr, n_points, c_in, c_out, kernel_size);
-    }
-    else if (c_in % 32 == 0 && c_out % 64 == 0) {
-        dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
-        dim3 num_threads(32, 2, 2);
-        flash_conv::flash_conv_sort_k32n64<<<num_blocks, num_threads>>>
-                          (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
-                          outputs_ptr, n_points, c_in, c_out, kernel_size);
-    }
-    else if (c_in % 32 == 0 && c_out % 32 == 0) {
+    // if (c_in % 64 == 0 && c_out % 64 == 0) {
+    //     dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
+    //     dim3 num_threads(32, 2, 2);
+    //     flash_conv::flash_conv_sort_k64n64<<<num_blocks, num_threads>>>
+    //                       (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
+    //                       outputs_ptr, n_points, c_in, c_out, kernel_size);
+    // }
+    // else if (c_in % 32 == 0 && c_out % 64 == 0) {
+    //     dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
+    //     dim3 num_threads(32, 2, 2);
+    //     flash_conv::flash_conv_sort_k32n64<<<num_blocks, num_threads>>>
+    //                       (inputs_ptr, weights_ptr, reorder_map_ptr, reduced_mask_ptr, reorder_loc_ptr,
+    //                       outputs_ptr, n_points, c_in, c_out, kernel_size);
+    // }
+    if (c_in % 32 == 0 && c_out % 32 == 0) {
         dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 32));
         dim3 num_threads(32, 2, 2);
         flash_conv::flash_conv_sort_k32n32<<<num_blocks, num_threads>>>

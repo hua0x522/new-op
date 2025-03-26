@@ -20,4 +20,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gray_encode_cuda", &gray_encode_cuda);
   m.def("gray_decode_cuda", &gray_decode_cuda);
   m.def("sparse_conv_base_cuda", &sparse_conv_base_cuda);
+  m.def("subm_conv_cuda", &subm_conv_cuda);
 }
