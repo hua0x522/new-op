@@ -985,8 +985,7 @@ __global__ void subm_conv_kernel(half* inputs, half* weights, int* reorder_map, 
 }
 
 torch::Tensor subm_conv_cuda(torch::Tensor inputs, torch::Tensor weights, torch::Tensor reorder_map,
-                            torch::Tensor mma_mask, torch::Tensor reorder_loc, int num_out_feats,
-                            int BLK_M, int BLK_N, int BLK_K, int WARP_M, int WARP_N) {
+                            torch::Tensor mma_mask, torch::Tensor reorder_loc, int num_out_feats) {
     int c_in = weights.size(1);
     int c_out = weights.size(2);
     int n_points = num_out_feats;
@@ -1001,24 +1000,6 @@ torch::Tensor subm_conv_cuda(torch::Tensor inputs, torch::Tensor weights, torch:
     half* inputs_ptr = reinterpret_cast<half*>(inputs.data_ptr<at::Half>());
     half* weights_ptr = reinterpret_cast<half*>(weights.data_ptr<at::Half>());
     half* outputs_ptr = reinterpret_cast<half*>(outputs.data_ptr<at::Half>());
-
-    if (c_in % BLK_K != 0 || c_out % BLK_N != 0 || 128 % BLK_M != 0) {
-        printf("shape miss alignment !\n");
-    }
-
-    if (BLK_M == 128) {
-        if (BLK_K == 64) {
-            if (BLK_N == 64) {
-                
-            }
-        }
-    } 
-    else if (BLK_M == 64) {
-
-    }
-    else if (BLK_M == 32) {
-
-    }
 
     dim3 num_blocks(cdiv(n_points, 128), cdiv(c_out, 64));
     dim3 num_threads(32, 2, 2);
