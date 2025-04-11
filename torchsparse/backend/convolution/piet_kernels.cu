@@ -136,24 +136,26 @@ __device__ static void load_shm_A(half* shm_A, half* inputs, int* reorder_map, i
     const int load_elements = 128 / 16;
     const int thread_per_row = BLK_K / load_elements;
     const int rows_per_load = NUM_THREAD / thread_per_row;
-    const int load_per_thread = BLK_M / rows_per_load;
+    const int load_per_thread = max(BLK_M / rows_per_load, 1);
     
     for (int i = 0; i < load_per_thread; i++) {
         int row = i * rows_per_load + tid / thread_per_row;
-        int col = tid % thread_per_row * load_elements;
-        int row_A = reorder_map[(blockIdx.x * BLK_M + row) * kernel_size + (ko * BLK_K) / c_in];
-        int col_A = (ko * BLK_K + col) % c_in;
-        int shm_row = row;
-        int shm_col = col ^ ((shm_row & 7) << 3);
-        if (row_A == -1) {
-            *(int4*)&shm_A[shm_row * BLK_K + shm_col] = make_int4(0, 0, 0, 0);
-        } 
-        else {
-            __pipeline_memcpy_async(
-                &shm_A[shm_row * BLK_K + shm_col],
-                &inputs[row_A * c_in + col_A],
-                16
-            );
+        if (row < BLK_M) {
+            int col = tid % thread_per_row * load_elements;
+            int row_A = reorder_map[(blockIdx.x * BLK_M + row) * kernel_size + (ko * BLK_K) / c_in];
+            int col_A = (ko * BLK_K + col) % c_in;
+            int shm_row = row;
+            int shm_col = col ^ ((shm_row & (BLK_K / 8 - 1)) << 3);
+            if (row_A == -1) {
+                *(int4*)&shm_A[shm_row * BLK_K + shm_col] = make_int4(0, 0, 0, 0);
+            } 
+            else {
+                __pipeline_memcpy_async(
+                    &shm_A[shm_row * BLK_K + shm_col],
+                    &inputs[row_A * c_in + col_A],
+                    16
+                );
+            }
         }
     }
     __syncthreads();
@@ -164,17 +166,19 @@ __device__ static void load_shm_B(half* shm_B, half* B, int K, int N, int ko) {
     const int load_elements = 128 / 16;
     const int thread_per_row = BLK_N / load_elements;
     const int rows_per_load = NUM_THREAD / thread_per_row;
-    const int load_per_thread = BLK_K / rows_per_load;
+    const int load_per_thread = max(BLK_K / rows_per_load, 1);
 
     for (int i = 0; i < load_per_thread; i++) {
         int row = i * rows_per_load + tid / thread_per_row;
-        int col = tid % thread_per_row * load_elements;
-        int shm_col = col ^ ((row & 7) << 3);
-        __pipeline_memcpy_async(
-            &shm_B[row * BLK_N + shm_col],
-            &B[(ko * BLK_K + row) * N + blockIdx.y * BLK_N + col],
-            16
-        );
+        if (row < BLK_K) {
+            int col = tid % thread_per_row * load_elements;
+            int shm_col = col ^ ((row & (BLK_N / 8 - 1)) << 3);
+            __pipeline_memcpy_async(
+                &shm_B[row * BLK_N + shm_col],
+                &B[(ko * BLK_K + row) * N + blockIdx.y * BLK_N + col],
+                16
+            );
+        }
     }
     __syncthreads();
 }
@@ -184,7 +188,7 @@ __device__ static void load_reg_A(uint32_t* reg_A, half* shm_A, int ki, int m) {
     int row = threadIdx.z * WARP_M + m * MMA_M + lane_id % 16;
     int col = ki * MMA_K + lane_id / 16 * 8;
     int shm_row = row;
-    int shm_col = col ^ ((shm_row & 7) << 3);
+    int shm_col = col ^ ((shm_row & (BLK_K / 8 - 1)) << 3);
     uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + shm_row * BLK_K + shm_col);
     LDMATRIX_X4(reg_A[ki * NUM_MMA_M * 4 + m * 4], reg_A[ki * NUM_MMA_M * 4 + m * 4 + 1], 
                 reg_A[ki * NUM_MMA_M * 4 + m * 4 + 2], reg_A[ki * NUM_MMA_M * 4 + m * 4 + 3], 
@@ -196,7 +200,7 @@ __device__ static void load_reg_B(uint32_t* reg_B, half* shm_B, int ki) {
     for (int ni = 0; ni < WARP_N / (MMA_N * 2); ni++) {
         int row = ki * MMA_K + lane_id % 16;
         int col = threadIdx.y * WARP_N + ni * (MMA_N * 2) + lane_id / 16 * 8;
-        col = col ^ ((row & 7) << 3);
+        col = col ^ ((row & (BLK_N / 8 - 1)) << 3);
         uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + row * BLK_N + col);
         LDMATRIX_X4_T(reg_B[ki * NUM_MMA_N * 2 + ni * 4], reg_B[ki * NUM_MMA_N * 2 + ni * 4 + 1], 
             reg_B[ki * NUM_MMA_N * 2 + ni * 4 + 2], reg_B[ki * NUM_MMA_N * 2 + ni * 4 + 3], 
@@ -321,31 +325,1468 @@ torch::Tensor subm_conv_cuda(torch::Tensor inputs, torch::Tensor weights, torch:
         return outputs;
     }
 
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 128 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<128, 64, 128, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 128 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<128, 64, 128, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 128 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 128, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 128 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<128, 64, 128, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 128 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<128, 64, 128, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 128 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 128, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<128, 64, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<128, 64, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 64 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<128, 64, 64, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
     if (BLK_M == 128 && BLK_K == 64 && BLK_N == 64 && WARP_M == 64 && WARP_N == 32) {
         subm_conv_kernel<128, 64, 64, 64, 32>
             <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
             (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
             outputs_ptr, n_points, c_in, c_out, kernel_size);
     }
-    else if (BLK_M == 64 && BLK_K == 64 && BLK_N == 64 && WARP_M == 64 && WARP_N == 32) {
-        subm_conv_kernel<64, 64, 64, 64, 32>
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 64 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 64, 64, 16>
             <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
             (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
             outputs_ptr, n_points, c_in, c_out, kernel_size);
     }
-    else if (BLK_M == 64 && BLK_K == 64 && BLK_N == 64 && WARP_M == 32 && WARP_N == 32) {
-        subm_conv_kernel<64, 64, 64, 32, 32>
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 64 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<128, 64, 64, 32, 64>
             <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
             (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
             outputs_ptr, n_points, c_in, c_out, kernel_size);
     }
-
-    else if (BLK_M == 128 && BLK_K == 32 && BLK_N == 128 && WARP_M == 32 && WARP_N == 32) {
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 64 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<128, 64, 64, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 64 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 64, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<128, 64, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<128, 64, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 32 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<128, 64, 32, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 32 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 32, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 32 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<128, 64, 32, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 32 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 32, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<128, 64, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 16 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 16, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 16 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 16, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 64 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 64, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 128 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<128, 32, 128, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 128 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<128, 32, 128, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 128 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 128, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 128 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<128, 32, 128, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 128 && WARP_M == 32 && WARP_N == 32) {
         subm_conv_kernel<128, 32, 128, 32, 32>
             <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
             (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
             outputs_ptr, n_points, c_in, c_out, kernel_size);
     }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 128 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 128, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<128, 32, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<128, 32, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 64 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<128, 32, 64, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 64 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<128, 32, 64, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 64 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 64, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 64 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<128, 32, 64, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 64 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<128, 32, 64, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 64 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 64, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<128, 32, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<128, 32, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 32 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<128, 32, 32, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 32 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 32, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 32 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<128, 32, 32, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 32 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 32, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<128, 32, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 16 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 16, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 16 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 16, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 32 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 32, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 128 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<128, 16, 128, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 128 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<128, 16, 128, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 128 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 128, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 128 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<128, 16, 128, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 128 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<128, 16, 128, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 128 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 128, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<128, 16, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<128, 16, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 64 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<128, 16, 64, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 64 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<128, 16, 64, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 64 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 64, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 64 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<128, 16, 64, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 64 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<128, 16, 64, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 64 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 64, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<128, 16, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<128, 16, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 32 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<128, 16, 32, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 32 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 32, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 32 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<128, 16, 32, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 32 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 32, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<128, 16, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 16 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 16, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 16 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 16, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 128 && BLK_K == 16 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<128, 16, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 128 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<64, 64, 128, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 128 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<64, 64, 128, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 128 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 128, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 128 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<64, 64, 128, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 128 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<64, 64, 128, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 128 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 128, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<64, 64, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<64, 64, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 64 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<64, 64, 64, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 64 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<64, 64, 64, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 64 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 64, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 64 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<64, 64, 64, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 64 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<64, 64, 64, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 64 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 64, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<64, 64, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<64, 64, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 32 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<64, 64, 32, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 32 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 32, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 32 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<64, 64, 32, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 32 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 32, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<64, 64, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 16 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 16, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 16 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 16, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 64 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 64, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 128 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<64, 32, 128, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 128 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<64, 32, 128, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 128 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 128, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 128 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<64, 32, 128, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 128 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<64, 32, 128, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 128 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 128, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<64, 32, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<64, 32, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 64 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<64, 32, 64, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 64 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<64, 32, 64, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 64 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 64, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 64 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<64, 32, 64, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 64 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<64, 32, 64, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 64 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 64, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<64, 32, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<64, 32, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 32 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<64, 32, 32, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 32 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 32, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 32 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<64, 32, 32, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 32 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 32, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<64, 32, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 16 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 16, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 16 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 16, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 32 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 32, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 128 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<64, 16, 128, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 128 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<64, 16, 128, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 128 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 128, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 128 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<64, 16, 128, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 128 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<64, 16, 128, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 128 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 128, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<64, 16, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<64, 16, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 64 && WARP_M == 64 && WARP_N == 64) {
+        subm_conv_kernel<64, 16, 64, 64, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 64 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<64, 16, 64, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 64 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 64, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 64 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<64, 16, 64, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 64 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<64, 16, 64, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 64 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 64, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<64, 16, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<64, 16, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 32 && WARP_M == 64 && WARP_N == 32) {
+        subm_conv_kernel<64, 16, 32, 64, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 32 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 32, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 32 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<64, 16, 32, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 32 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 32, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<64, 16, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 16 && WARP_M == 64 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 16, 64, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 16 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 16, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 64 && BLK_K == 16 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<64, 16, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 128 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<32, 64, 128, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 128 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<32, 64, 128, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 128 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 64, 128, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<32, 64, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<32, 64, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 64, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 64 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<32, 64, 64, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 64 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<32, 64, 64, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 64 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 64, 64, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<32, 64, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<32, 64, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 64, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 32 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<32, 64, 32, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 32 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 64, 32, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<32, 64, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 64, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 16 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 64, 16, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 64 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 64, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 128 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<32, 32, 128, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 128 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<32, 32, 128, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 128 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 32, 128, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<32, 32, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<32, 32, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 32, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 64 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<32, 32, 64, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 64 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<32, 32, 64, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 64 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 32, 64, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<32, 32, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<32, 32, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 32, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 32 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<32, 32, 32, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 32 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 32, 32, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<32, 32, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 32, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 16 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 32, 16, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 32 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 32, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 128 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<32, 16, 128, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 128 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<32, 16, 128, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 128 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 16, 128, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<32, 16, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<32, 16, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 16, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 64 && WARP_M == 32 && WARP_N == 64) {
+        subm_conv_kernel<32, 16, 64, 32, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 64 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<32, 16, 64, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 64 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 16, 64, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<32, 16, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<32, 16, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 16, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 32 && WARP_M == 32 && WARP_N == 32) {
+        subm_conv_kernel<32, 16, 32, 32, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 32 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 16, 32, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<32, 16, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 16, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 16 && WARP_M == 32 && WARP_N == 16) {
+        subm_conv_kernel<32, 16, 16, 32, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 32 && BLK_K == 16 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<32, 16, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<16, 64, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<16, 64, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 64 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 64, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<16, 64, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<16, 64, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 64 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 64, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 64 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<16, 64, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 64 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 64, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 64 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 64, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<16, 32, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<16, 32, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 32 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 32, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<16, 32, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<16, 32, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 32 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 32, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 32 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<16, 32, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 32 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 32, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 32 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 32, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<16, 16, 128, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<16, 16, 128, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 16 && BLK_N == 128 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 16, 128, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 64) {
+        subm_conv_kernel<16, 16, 64, 16, 64>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<16, 16, 64, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 16 && BLK_N == 64 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 16, 64, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 16 && BLK_N == 32 && WARP_M == 16 && WARP_N == 32) {
+        subm_conv_kernel<16, 16, 32, 16, 32>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 16 && BLK_N == 32 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 16, 32, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+    if (BLK_M == 16 && BLK_K == 16 && BLK_N == 16 && WARP_M == 16 && WARP_N == 16) {
+        subm_conv_kernel<16, 16, 16, 16, 16>
+            <<<dim3(cdiv(n_points, BLK_M), cdiv(c_out, BLK_N)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
+            (inputs_ptr, weights_ptr, reorder_map_ptr, mma_mask_ptr, reorder_loc_ptr,
+            outputs_ptr, n_points, c_in, c_out, kernel_size);
+    }
+
+    // else {
+    //     printf("unsupported kernel shape\n");
+    // }
 
     // subm_conv_kernel<BLK_M, BLK_K, BLK_N, WARP_M, WARP_N>
     //     <<<dim3(cdiv(n_points, 128), cdiv(c_out, 64)), dim3(32, BLK_N / WARP_N, BLK_M / WARP_M)>>>
